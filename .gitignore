@@ -1,4 +1,5 @@
-# Rust build artifacts
+# Rust build artifacts (including local cache symlinks)
+/target
 target/
 
 # Generated output from the previous application
