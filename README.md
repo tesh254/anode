@@ -1,73 +1,70 @@
-# React + TypeScript + Vite
+# Anode
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A native hardware programming IDE built with Rust and GPUI Kit. Edit Python and
+Arduino projects, detect USB boards, use a serial REPL, and flash or upload from
+independent dockable device panels.
 
-Currently, two official plugins are available:
+Rust is the main application. Run all commands from this repository root.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Development
 
-## React Compiler
+Install Rust and the native platform build tools. On macOS, install Xcode Command
+Line Tools. The application is validated with Rust 1.99.1 on macOS.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```sh
+cargo run --locked
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Build a release binary:
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```sh
+cargo build --release --locked
 ```
+
+## macOS application
+
+```sh
+./scripts/bundle-macos.sh
+open target/release/Anode.app
+```
+
+The script builds the native application, generates its standalone Anode icon,
+and creates a locally signed `.app` bundle. Distribution signing and notarization
+are separate release work.
+
+## Checks
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+```
+
+## Device tools
+
+USB discovery and the serial REPL run in the application. Python 3 and external
+tools are needed for device operations:
+
+```sh
+python3 -m pip install mpremote esptool
+```
+
+Install `arduino-cli` for Arduino compilation and upload. Firmware downloads use
+`curl`. A Pico firmware operation writes to its mounted RPI-RP2 BOOTSEL volume.
+
+## Workspace
+
+- Files, Boards, Editor, Output and REPL can be docked, grouped and resized.
+- Boards lists the last 12 connected devices and updates USB presence automatically.
+- Each physical board can have its own panel, model selection, flash/upload job
+  and output. Port locks prevent concurrent operations on the same device.
+- Recent projects, device history, model overrides and panel layout persist in
+  the user configuration directory.
+- For an isolated development session, set `ANODE_CONFIG_DIR` to another folder.
+
+See [architecture and current limitations](docs/architecture.md).
+
+## Previous implementation
+
+The Electron application was checkpointed in commit `99985a4` before replacement.
+Its source, tests and build configuration remain available in Git history.
