@@ -18,6 +18,10 @@ pub struct Settings {
     pub last_profile_id: String,
     /// Manual board choices keyed by a port's serial number (or path).
     pub board_overrides: std::collections::HashMap<String, String>,
+    /// Replacement `arduino-cli` FQBNs, keyed by catalog board id. Cores
+    /// rename boards between releases, so the catalog's value is a default
+    /// the user can correct without waiting for an Anode update.
+    pub fqbn_overrides: std::collections::HashMap<String, String>,
     pub recent_boards: Vec<crate::hardware::RecentBoard>,
     pub panel_layout: Option<gpui_kit::component::dock::DockAreaState>,
 }
@@ -50,6 +54,7 @@ impl Default for Settings {
             last_port_path: String::new(),
             last_profile_id: String::new(),
             board_overrides: Default::default(),
+            fqbn_overrides: Default::default(),
             recent_boards: Vec::new(),
             panel_layout: None,
         }

@@ -9,7 +9,9 @@ pub mod profiles;
 pub mod project;
 pub mod repl;
 pub mod settings;
+pub(crate) mod terminal;
 pub mod theme;
+pub mod toolchain;
 pub mod views;
 pub mod workspace_state;
 

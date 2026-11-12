@@ -1,14 +1,21 @@
 //! Dockable workspace tools. Each tool owns retained focus and lifecycle;
 //! device panels additionally own their target and background jobs.
+mod agent;
+mod catalog;
 mod flash;
 
 use crate::hardware::{PortLeases, RecentBoard};
 use crate::workspace_state::Workspace;
+use agent::AgentPanel;
+use catalog::CatalogPanel;
 use flash::FlashPanel;
 use gpui_kit::component::dock::{
     panel_handle, register_panel, BasePanel, DockArea, DockAreaState, DockEvent, DockLayout,
-    DockPlacement, DockSkin, Panel, PanelEvent, PanelId, PanelInfo, PanelStyle,
+    DockPlacement, DockSkin, InsertTarget, NodeId, Panel, PanelEvent, PanelId, PanelInfo,
+    PanelStyle,
 };
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
@@ -23,35 +30,68 @@ use std::time::Duration;
 pub(crate) enum Tool {
     Files,
     Boards,
+    Catalog,
     Editor,
     Output,
+    Terminal,
     Repl,
+    Device,
+    Agent,
 }
+
 impl Tool {
-    fn name(self) -> &'static str {
+    /// Every tool that renders through the shared [`ToolPanel`]. `Catalog`
+    /// owns its own entity, so it is deliberately not here.
+    const SHARED: &'static [Tool] = &[
+        Tool::Files,
+        Tool::Boards,
+        Tool::Editor,
+        Tool::Output,
+        Tool::Terminal,
+        Tool::Repl,
+        Tool::Device,
+    ];
+
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Files => "Files",
             Self::Boards => "Boards",
+            Self::Catalog => "Catalog",
             Self::Editor => "Editor",
             Self::Output => "Output",
+            Self::Terminal => "Terminal",
             Self::Repl => "REPL",
+            Self::Device => "Board",
+            Self::Agent => "Agent",
         }
     }
+
     fn registry_name(self) -> &'static str {
         match self {
             Self::Files => "anode.files",
             Self::Boards => "anode.boards",
+            Self::Catalog => "anode.catalog",
             Self::Editor => "anode.editor",
             Self::Output => "anode.output",
+            Self::Terminal => "anode.terminal",
             Self::Repl => "anode.repl",
+            Self::Device => "anode.device",
+            Self::Agent => "anode.agent",
         }
     }
+
     fn placement(self) -> DockPlacement {
         match self {
-            Self::Files | Self::Boards => DockPlacement::Left,
+            Self::Files | Self::Boards | Self::Catalog => DockPlacement::Left,
             Self::Editor => DockPlacement::Center,
-            Self::Output | Self::Repl => DockPlacement::Bottom,
+            Self::Output | Self::Repl | Self::Terminal => DockPlacement::Bottom,
+            Self::Device | Self::Agent => DockPlacement::Right,
         }
+    }
+
+    /// True for the tools that share the bottom console tab group.
+    fn is_console(self) -> bool {
+        matches!(self, Self::Terminal | Self::Output | Self::Repl)
     }
 }
 
@@ -61,6 +101,7 @@ struct ToolPanel {
     focus: FocusHandle,
     _subscription: Option<Subscription>,
 }
+
 impl ToolPanel {
     fn new(tool: Tool, owner: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         let subscription = owner
@@ -74,12 +115,20 @@ impl ToolPanel {
         }
     }
 }
+
 impl EventEmitter<PanelEvent> for ToolPanel {}
+
 impl Focusable for ToolPanel {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        if self.tool == Tool::Terminal {
+            if let Some(owner) = self.owner.upgrade() {
+                return owner.read(cx).terminal.read(cx).focus_handle(cx);
+            }
+        }
         self.focus.clone()
     }
 }
+
 impl BasePanel for ToolPanel {
     fn panel_name(&self) -> &'static str {
         self.tool.registry_name()
@@ -88,6 +137,7 @@ impl BasePanel for ToolPanel {
         self.tool != Tool::Editor
     }
 }
+
 impl Panel for ToolPanel {
     fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         self.tool.name()
@@ -98,29 +148,48 @@ impl Panel for ToolPanel {
     fn inner_padding(&self, _: &App) -> bool {
         false
     }
+    fn title_bar(&self, _: &App) -> bool {
+        // These three draw their own header row, so a second one would be a
+        // duplicate boundary.
+        !matches!(self.tool, Tool::Editor | Tool::Files | Tool::Device)
+    }
 }
+
 impl Render for ToolPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tool = self.tool;
         let content = self
             .owner
             .update(cx, |workspace, cx| match tool {
-                Tool::Files => workspace.render_sidebar(window, cx).into_any_element(),
+                Tool::Files => workspace.render_sidebar(cx).into_any_element(),
                 Tool::Boards => workspace.render_recent_boards(cx).into_any_element(),
                 Tool::Editor => gpui_kit::base::v_flex()
                     .size_full()
                     .min_h_0()
-                    .child(workspace.render_editor_tabs(cx))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .overflow_hidden()
+                    .child(workspace.render_editor_tabs(window, cx))
                     .child(workspace.render_editor(cx))
                     .into_any_element(),
-                Tool::Output => workspace.render_shell_log(cx).into_any_element(),
+                Tool::Output => workspace.render_output(cx).into_any_element(),
+                Tool::Terminal => workspace.terminal.clone().into_any_element(),
                 Tool::Repl => workspace.render_repl(cx).into_any_element(),
+                Tool::Device => workspace
+                    .render_device_inspector(window, cx)
+                    .into_any_element(),
+                // Rendered by `CatalogPanel`, which owns its own state.
+                Tool::Catalog | Tool::Agent => div().into_any_element(),
             })
             .unwrap_or_else(|_| div().into_any_element());
         gpui_kit::base::v_flex()
             .size_full()
             .min_h_0()
             .track_focus(&self.focus)
+            .when(tool == Tool::Editor, |this| {
+                this.p_2().bg(cx.theme().sidebar)
+            })
             .child(content)
     }
 }
@@ -130,10 +199,13 @@ type FlashPanels = Rc<RefCell<BTreeMap<String, WeakEntity<FlashPanel>>>>;
 pub(crate) struct PanelWorkspace {
     pub(crate) dock: Entity<DockArea>,
     tools: BTreeMap<Tool, Entity<ToolPanel>>,
+    catalog: Entity<CatalogPanel>,
+    agent: Entity<AgentPanel>,
     flashes: FlashPanels,
     owner: WeakEntity<Workspace>,
     leases: PortLeases,
 }
+
 impl PanelWorkspace {
     fn new(
         owner: WeakEntity<Workspace>,
@@ -142,17 +214,12 @@ impl PanelWorkspace {
         window: &mut Window,
         cx: &mut App,
     ) -> Self {
-        let (dock, skin) = DockSkin::dock_area("anode-workspace", Some(1), window, cx);
-        skin.set_panel_style(PanelStyle::TabBar, cx);
+        let (dock, skin) = DockSkin::dock_area("anode-workspace", Some(3), window, cx);
+        skin.set_panel_style(PanelStyle::Auto, cx);
         skin.set_close_button_visible(true, cx);
+
         let mut tools = BTreeMap::new();
-        for tool in [
-            Tool::Files,
-            Tool::Boards,
-            Tool::Editor,
-            Tool::Output,
-            Tool::Repl,
-        ] {
+        for tool in Tool::SHARED.iter().copied() {
             let panel = cx.new(|cx| ToolPanel::new(tool, owner.clone(), cx));
             let restored = panel.clone();
             register_panel(cx, tool.registry_name(), move |_, _, _| {
@@ -160,6 +227,19 @@ impl PanelWorkspace {
             });
             tools.insert(tool, panel);
         }
+
+        let catalog = cx.new(|cx| CatalogPanel::new(owner.clone(), window, cx));
+        let restored_catalog = catalog.clone();
+        register_panel(cx, Tool::Catalog.registry_name(), move |_, _, _| {
+            panel_handle(restored_catalog.clone())
+        });
+
+        let agent = cx.new(|cx| AgentPanel::new(owner.clone(), window, cx));
+        let restored_agent = agent.clone();
+        register_panel(cx, Tool::Agent.registry_name(), move |_, _, _| {
+            panel_handle(restored_agent.clone())
+        });
+
         let flashes: FlashPanels = Rc::default();
         let restored_flashes = flashes.clone();
         let restored_owner = owner.clone();
@@ -194,27 +274,34 @@ impl PanelWorkspace {
             restored_flashes.borrow_mut().insert(key, panel.downgrade());
             panel_handle(panel)
         });
+
         let this = Self {
             dock,
             tools,
+            catalog,
+            agent,
             flashes,
             owner,
             leases,
         };
+        // Version 3 added the catalog panel; an older saved layout is dropped
+        // rather than restored without it.
         let restored = saved
-            .filter(|state| state.version == Some(1))
+            .filter(|state| state.version == Some(3))
             .is_some_and(|state| {
                 this.dock
                     .update(cx, |dock, cx| dock.load(state, window, cx).is_ok())
             });
         if !restored {
             this.reset_layout(window, cx);
+        } else {
+            this.ensure_agent_tab(window, cx);
         }
         this
     }
 
     fn reset_layout(&self, window: &mut Window, cx: &mut App) {
-        // Retain all board panels and any running jobs when resetting the tools.
+        // Retain all board panels and any running jobs when resetting tools.
         let boards: Vec<_> = self
             .flashes
             .borrow()
@@ -222,25 +309,30 @@ impl PanelWorkspace {
             .filter_map(WeakEntity::upgrade)
             .collect();
         let rem = window.rem_size();
-        let layout =
+        let tabs =
             |tool| DockLayout::tabs().panel_view(panel_handle(self.tools[&tool].clone()), cx);
-        let editor = layout(Tool::Editor);
-        let left = DockLayout::v_split()
-            .child(layout(Tool::Files), Some(rem * 26.0))
-            .child(layout(Tool::Boards), None);
         let bottom = DockLayout::tabs()
             .panel_view(panel_handle(self.tools[&Tool::Output].clone()), cx)
-            .panel_view(panel_handle(self.tools[&Tool::Repl].clone()), cx);
+            .panel_view(panel_handle(self.tools[&Tool::Repl].clone()), cx)
+            .panel_view(panel_handle(self.tools[&Tool::Terminal].clone()), cx);
+        let center = DockLayout::v_split()
+            .child(tabs(Tool::Editor), None)
+            .child(bottom, Some(rem * 15.0));
+        let left = DockLayout::tabs()
+            .panel_view(panel_handle(self.tools[&Tool::Files].clone()), cx)
+            .panel_view(panel_handle(self.tools[&Tool::Boards].clone()), cx)
+            .panel_view(panel_handle(self.catalog.clone()), cx);
+        let right = tabs(Tool::Device).panel_view(panel_handle(self.agent.clone()), cx);
         self.dock.update(cx, |dock, cx| {
-            dock.set_center(editor, window, cx);
-            if dock.has_dock(DockPlacement::Right) {
-                dock.remove_dock(DockPlacement::Right, window, cx);
+            dock.set_center(center, window, cx);
+            if dock.has_dock(DockPlacement::Bottom) {
+                dock.remove_dock(DockPlacement::Bottom, window, cx);
             }
             dock.set_dock(DockPlacement::Left, left, window, cx);
-            dock.set_dock_size(DockPlacement::Left, rem * 18.0, window, cx);
-            dock.set_dock(DockPlacement::Bottom, bottom, window, cx);
-            dock.set_dock_size(DockPlacement::Bottom, rem * 15.0, window, cx);
-            for placement in [DockPlacement::Left, DockPlacement::Bottom] {
+            dock.set_dock_size(DockPlacement::Left, rem * 17.0, window, cx);
+            dock.set_dock(DockPlacement::Right, right, window, cx);
+            dock.set_dock_size(DockPlacement::Right, rem * 26.0, window, cx);
+            for placement in [DockPlacement::Left, DockPlacement::Right] {
                 if !dock.is_dock_open(placement) {
                     dock.toggle_dock(placement, window, cx);
                 }
@@ -257,16 +349,112 @@ impl PanelWorkspace {
         });
     }
 
+    /// Add the new tab to saved layouts without resetting the user's panes.
+    fn ensure_agent_tab(&self, window: &mut Window, cx: &mut App) {
+        let id = PanelId::from(self.agent.entity_id());
+        self.dock.update(cx, |dock, cx| {
+            if dock.panel(id).is_some() {
+                return;
+            }
+            let board = PanelId::from(self.tools[&Tool::Device].entity_id());
+            let node = [
+                DockPlacement::Right,
+                DockPlacement::Center,
+                DockPlacement::Left,
+                DockPlacement::Bottom,
+            ]
+            .into_iter()
+            .find_map(|placement| dock.layout(placement)?.find_panel_node(board));
+            dock.add_panel_view(
+                panel_handle(self.agent.clone()),
+                DockPlacement::Right,
+                None,
+                window,
+                cx,
+            );
+            if let Some(node) = node {
+                dock.move_panel(
+                    id,
+                    InsertTarget::Tabs {
+                        node,
+                        ix: None,
+                        activate: false,
+                    },
+                    window,
+                    cx,
+                );
+            }
+        });
+    }
+
     fn open_tool(&self, tool: Tool, window: &mut Window, cx: &mut App) {
-        let panel = self.tools[&tool].clone();
-        let id = PanelId::from(panel.entity_id());
+        if tool == Tool::Agent {
+            self.ensure_agent_tab(window, cx);
+        }
+        let (id, handle) = match tool {
+            Tool::Agent => (
+                PanelId::from(self.agent.entity_id()),
+                panel_handle(self.agent.clone()),
+            ),
+            Tool::Catalog => (
+                PanelId::from(self.catalog.entity_id()),
+                panel_handle(self.catalog.clone()),
+            ),
+            _ => {
+                let panel = self.tools[&tool].clone();
+                (PanelId::from(panel.entity_id()), panel_handle(panel))
+            }
+        };
         self.dock.update(cx, |dock, cx| {
             if dock.panel(id).is_none() {
-                dock.add_panel_view(panel_handle(panel), tool.placement(), None, window, cx);
+                // A console tool joins the existing console group wherever the
+                // user has moved it, rather than opening a second one.
+                let target = tool.is_console().then(|| self.console_node(dock)).flatten();
+                dock.add_panel_view(
+                    handle,
+                    if target.is_some() {
+                        DockPlacement::Center
+                    } else {
+                        tool.placement()
+                    },
+                    None,
+                    window,
+                    cx,
+                );
+                if let Some(node) = target {
+                    dock.move_panel(
+                        id,
+                        InsertTarget::Tabs {
+                            node,
+                            ix: Some(0),
+                            activate: true,
+                        },
+                        window,
+                        cx,
+                    );
+                }
             }
             reveal_panel(dock, id, window, cx);
             dock.select_panel(id, window, cx);
         });
+    }
+
+    /// The dock node that already holds a console tool, if any.
+    fn console_node(&self, dock: &DockArea) -> Option<NodeId> {
+        Tool::SHARED
+            .iter()
+            .filter(|tool| tool.is_console())
+            .find_map(|tool| {
+                let id = PanelId::from(self.tools[tool].entity_id());
+                [
+                    DockPlacement::Center,
+                    DockPlacement::Bottom,
+                    DockPlacement::Left,
+                    DockPlacement::Right,
+                ]
+                .into_iter()
+                .find_map(|placement| dock.layout(placement)?.find_panel_node(id))
+            })
     }
 
     fn open_flash(&self, record: RecentBoard, window: &mut Window, cx: &mut App) {
@@ -318,6 +506,7 @@ impl Workspace {
         self.panels = Some(panels);
         cx.notify();
     }
+
     pub(crate) fn save_panel_layout(&mut self, cx: &mut Context<Self>) {
         let Some(dock) = self.panels.as_ref().map(|panels| panels.dock.clone()) else {
             return;
@@ -333,11 +522,16 @@ impl Workspace {
         }));
     }
 
-    pub(crate) fn show_tool(&self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn show_tool(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(tool, Tool::Editor | Tool::Repl | Tool::Device) {
+            self.workspace_mode = tool;
+        }
         if let Some(panels) = &self.panels {
             panels.open_tool(tool, window, cx);
         }
+        cx.notify();
     }
+
     pub(crate) fn open_board_panel(
         &self,
         record: RecentBoard,
@@ -348,6 +542,7 @@ impl Workspace {
             panels.open_flash(record, window, cx);
         }
     }
+
     pub(crate) fn reset_panels(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(panels) = &self.panels {
             panels.reset_layout(window, cx);

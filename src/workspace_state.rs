@@ -1,21 +1,23 @@
 //! The main Anode workspace state.
 //!
-//! Translated from `src/App.tsx` + `src/lib/store.ts` (the non-persisted
-//! subset). What was a Zustand store plus a tree of React components is one
-//! GPUI entity: domain state lives in named fields, editing state in child
-//! entities created once in `new`, and the React effects became explicit
-//! tasks and subscription handlers.
+//! Domain state lives in named fields, editing state in child entities
+//! created once in `new`, and everything asynchronous in explicit tasks and
+//! subscription handlers. Device work runs on background threads and reports
+//! back through channels drained on the UI thread.
 
-use crate::boards::{self, BoardType, PortIdentity};
-use crate::device::{self, DeviceEvent};
+use crate::boards::{self, BoardDef, BoardMatch, PortIdentity, Runtime};
+use crate::device::{self, DeviceEvent, FirmwareSource};
 use crate::profiles::{self, CircuitPythonDrive, Confidence, ExecutionProfile, WorkspaceLayout};
-use crate::project::{self, Language, ProjectFile};
+use crate::project::{self, Language, ProjectFile, ProjectKind};
 use crate::repl::{self, ReplConnection, ReplEvent};
 use crate::settings::{BottomMode, Settings};
+use crate::toolchain::{self, Tool, ToolStatus};
 
 use gpui_kit::base::input::EditorState;
 use gpui_kit::component::input::{InputEvent, InputState};
-use gpui_kit::{AppContext as _, Context, Entity, ScrollHandle, Subscription, Task, Window};
+use gpui_kit::{
+    AppContext as _, Context, Entity, ScrollHandle, SharedString, Subscription, Task, Window,
+};
 
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
@@ -35,11 +37,41 @@ pub enum LogKind {
     Flash,
 }
 
+impl LogKind {
+    /// True for the lines the Problems filter keeps.
+    pub fn is_problem(self) -> bool {
+        matches!(self, LogKind::Warn | LogKind::Error)
+    }
+}
+
+/// What the device log is currently showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogFilter {
+    #[default]
+    All,
+    Problems,
+}
+
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub id: u64,
     pub kind: LogKind,
-    pub message: String,
+    /// Local wall-clock time, so a long flash can be read against the board's
+    /// own behaviour.
+    pub time: SharedString,
+    /// `SharedString` because the Output panel clones every visible entry on
+    /// each frame; copying two `String`s per line per frame is what made a
+    /// running flash feel heavy.
+    pub message: SharedString,
+}
+
+/// Which way an Up/Down key moves through REPL history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryStep {
+    /// Up: towards the commands typed earlier.
+    Older,
+    /// Down: back towards the line being typed.
+    Newer,
 }
 
 /// One open editor tab.
@@ -67,9 +99,12 @@ pub struct Workspace {
     // Project state.
     pub project_path: Option<PathBuf>,
     pub project_name: String,
+    pub project_kind: ProjectKind,
     pub project_files: Vec<ProjectFile>,
     pub current_file: Option<ProjectFile>,
     pub is_dirty: bool,
+    /// `[env:…]` names from a PlatformIO project, when one is open.
+    pub platformio_environments: Vec<String>,
 
     // Multi-tab editor state.
     pub open_tabs: Vec<OpenTab>,
@@ -77,6 +112,7 @@ pub struct Workspace {
 
     // Editor state (retained entity).
     pub editor: Entity<EditorState>,
+    pub(crate) terminal: Entity<crate::terminal::TerminalView>,
     /// The file the editor currently shows, so changes land in the right slot.
     editor_file: Option<PathBuf>,
     /// Guard so a programmatic `set_value` doesn't mark the tab dirty.
@@ -85,43 +121,60 @@ pub struct Workspace {
     // Connection state.
     pub ports: Vec<PortIdentity>,
     pub selected_port: String,
-    pub detected_board: BoardType,
     pub available_profiles: Vec<ExecutionProfile>,
     pub active_profile: Option<ExecutionProfile>,
     pub profile_manually_set: bool,
     pub circuit_python_drive: Option<CircuitPythonDrive>,
     pub connection_dropped: bool,
 
+    // Toolchain availability, refreshed off the UI thread.
+    pub tool_statuses: Vec<ToolStatus>,
+    pub tools_scanning: bool,
+    _tools_task: Option<Task<()>>,
+
     // REPL state.
     pub repl_connection: Option<ReplConnection>,
     pub repl_connected: bool,
     pub repl_output: String,
     pub repl_input: Entity<InputState>,
+    /// Edits the `arduino-cli` board name for the selected board. Retained so
+    /// a half-typed FQBN survives a re-render and a USB poll tick.
+    pub fqbn_input: Entity<InputState>,
+    /// The board `fqbn_input` currently holds a value for, so switching board
+    /// replaces it instead of carrying the previous board's name over.
+    fqbn_input_board: Option<&'static str>,
     repl_events: Option<Receiver<ReplEvent>>,
     pub repl_history: Vec<String>,
+    /// Where the Up/Down keys currently sit in `repl_history`.
+    pub repl_history_cursor: Option<usize>,
 
-    // Shell log.
+    // Device log.
     pub log_entries: Vec<LogEntry>,
+    pub log_filter: LogFilter,
+    /// Whether the log keeps the newest line in view. Turning it off lets the
+    /// user read back through a long flash while it is still running.
+    pub log_follow: bool,
     pub log_scroll: ScrollHandle,
     next_log_id: u64,
 
     // Background device work: progress lines and completion.
     device_events: Option<Receiver<BackgroundOutcome>>,
     pub device_busy: bool,
-    /// Flashes/runs started before the poll task can deliver their result;
-    /// keyed by a monotonic token so a stale result is dropped.
-    pub flash_board_choice: BoardType,
+    /// A heartbeat that repaints while a device job runs. Progress is drained
+    /// in `render`, and the port poll now only repaints when discovery
+    /// changed, so a long flash needs its own reason to draw frames.
+    _device_poll: Option<Task<()>>,
 
     // Bottom panel.
     pub bottom_mode: BottomMode,
+    pub(crate) workspace_mode: crate::panels::Tool,
     pub(crate) panels: Option<crate::panels::PanelWorkspace>,
     pub(crate) port_leases: crate::hardware::PortLeases,
     pub(crate) layout_save_task: Option<Task<()>>,
 
-    // Retained Select entities (port, board, runtime profile, flash dialog).
+    // Retained Select entities (port, board, runtime profile).
     pub pickers: crate::views::Pickers,
     pub picker_caches: crate::views::PickerCaches,
-    pub pending_flash_tool: Option<String>,
     /// Set by the async folder picker; consumed on the next render pass where
     /// window access is available.
     pub pending_open_path: Option<PathBuf>,
@@ -142,9 +195,11 @@ impl Workspace {
         let editor = cx.new(|cx| {
             EditorState::new(window, cx)
                 .language("python")
-                .placeholder("// Open a file from the sidebar to start editing")
+                .placeholder("Open a file from the sidebar to start editing")
         });
-        let repl_input = cx.new(|cx| InputState::new(window, cx).placeholder(">>> …"));
+        let terminal = cx.new(crate::terminal::TerminalView::new);
+        let repl_input = cx.new(|cx| InputState::new(window, cx).placeholder(">>> "));
+        let fqbn_input = cx.new(|cx| InputState::new(window, cx).placeholder("vendor:arch:board"));
 
         let editor_subscription =
             cx.subscribe_in(&editor, window, |this, state, event, _window, cx| {
@@ -165,6 +220,7 @@ impl Workspace {
                     state.update(cx, |state, cx| {
                         state.set_value("", window, cx);
                     });
+                    cx.notify();
                 }
             });
 
@@ -172,55 +228,65 @@ impl Workspace {
             settings,
             project_path: None,
             project_name: String::new(),
+            project_kind: ProjectKind::Unknown,
             project_files: Vec::new(),
             current_file: None,
             is_dirty: false,
+            platformio_environments: Vec::new(),
             open_tabs: Vec::new(),
             active_tab: None,
             editor,
+            terminal,
             editor_file: None,
             editor_syncing: false,
             ports: Vec::new(),
             selected_port: String::new(),
-            detected_board: BoardType::Unknown,
             available_profiles: Vec::new(),
             active_profile: None,
             profile_manually_set: false,
             circuit_python_drive: None,
             connection_dropped: false,
+            tool_statuses: Vec::new(),
+            tools_scanning: false,
+            _tools_task: None,
             repl_connection: None,
             repl_connected: false,
             repl_output: String::new(),
             repl_input,
+            fqbn_input,
+            fqbn_input_board: None,
             repl_events: None,
             repl_history: Vec::new(),
+            repl_history_cursor: None,
             log_entries: Vec::new(),
+            log_filter: LogFilter::default(),
+            log_follow: true,
             log_scroll: ScrollHandle::new(),
             next_log_id: 1,
             device_events: None,
             device_busy: false,
-            flash_board_choice: BoardType::Unknown,
+            _device_poll: None,
             bottom_mode: BottomMode::Shell,
+            workspace_mode: crate::panels::Tool::Editor,
             panels: None,
             port_leases: Default::default(),
             layout_save_task: None,
             pickers: Default::default(),
             picker_caches: Default::default(),
-            pending_flash_tool: None,
             pending_open_path: None,
             needs_editor_sync: false,
             _poll_task: None,
             _subscriptions: vec![editor_subscription, repl_subscription],
         };
         this.start_port_polling(cx);
+        this.refresh_tools(cx);
         this
     }
 
     // -- Port polling --------------------------------------------------------
 
     /// Poll serial ports every second, auto-detect the board, and keep the
-    /// execution profile in step (translated from `refreshPorts` +
-    /// `useAutoConnect`).
+    /// runtime profile in step.
     fn start_port_polling(&mut self, cx: &mut Context<Self>) {
         self._poll_task = Some(
             cx.spawn(async move |this, cx: &mut gpui_kit::AsyncApp| loop {
@@ -231,12 +297,17 @@ impl Workspace {
                     .await;
                 if this
                     .update(cx, |this, cx| {
-                        if let Ok(ports) = ports {
-                            this.apply_port_snapshot(ports, drive);
+                        // Only a snapshot that actually changed something
+                        // visible is worth a frame. Notifying on every tick
+                        // redrew the whole window once a second forever,
+                        // which is what made typing elsewhere feel heavy.
+                        let changed = match ports {
+                            Ok(ports) => this.apply_port_snapshot(ports, drive),
+                            Err(_) => false,
+                        };
+                        if changed {
+                            cx.notify();
                         }
-                        // Discovery runs off the UI thread; notify after the coherent snapshot.
-                        // Active serial sessions also drain their queues in the ensuing render.
-                        cx.notify();
                     })
                     .is_err()
                 {
@@ -254,18 +325,27 @@ impl Workspace {
                 .await;
             _ = this.update(cx, |this, cx| {
                 match ports {
-                    Ok(ports) => this.apply_port_snapshot(ports, drive),
+                    Ok(ports) => {
+                        this.apply_port_snapshot(ports, drive);
+                    }
                     Err(error) => {
                         this.add_log(LogKind::Error, format!("Could not scan USB ports: {error}"))
                     }
                 }
+                // An explicit Scan always repaints, so the button visibly
+                // does something even when nothing was found.
                 cx.notify();
             });
         })
         .detach();
     }
 
-    fn apply_port_snapshot(&mut self, ports: Vec<PortIdentity>, drive: CircuitPythonDrive) {
+    /// Apply a discovery snapshot. Returns whether anything the UI draws
+    /// changed, so a quiet tick costs no frame.
+    fn apply_port_snapshot(&mut self, ports: Vec<PortIdentity>, drive: CircuitPythonDrive) -> bool {
+        let ports_changed = ports != self.ports;
+        let drive_changed = self.circuit_python_drive.as_ref() != Some(&drive);
+        let before = self.detection_state();
         let previous_key = self
             .selected_port_identity()
             .as_ref()
@@ -277,10 +357,7 @@ impl Workspace {
                     .find(|record| record.path == self.selected_port)
                     .map(|record| record.key.clone())
             });
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0);
+        let now = now_millis();
         if crate::hardware::remember_connections(
             &mut self.settings.recent_boards,
             &self.ports,
@@ -302,6 +379,20 @@ impl Workspace {
         self.circuit_python_drive = Some(drive);
         self.auto_connect_if_needed();
         self.detect_board_for_selected_port();
+        ports_changed || drive_changed || before != self.detection_state()
+    }
+
+    /// The parts of detection the UI reads, as a comparable snapshot.
+    fn detection_state(&self) -> (String, bool, Option<String>, usize, usize) {
+        (
+            self.selected_port.clone(),
+            self.connection_dropped,
+            self.active_profile
+                .as_ref()
+                .map(|profile| profile.id.clone()),
+            self.available_profiles.len(),
+            self.settings.recent_boards.len(),
+        )
     }
 
     fn auto_connect_if_needed(&mut self) {
@@ -315,15 +406,16 @@ impl Workspace {
         {
             return;
         }
-        let candidate = if !self.settings.last_port_path.is_empty() {
+        let candidate = if self.settings.last_port_path.is_empty() {
+            None
+        } else {
             self.ports
                 .iter()
-                .find(|p| {
-                    p.path == self.settings.last_port_path && profiles::is_likely_hardware_port(p)
+                .find(|port| {
+                    port.path == self.settings.last_port_path
+                        && profiles::is_likely_hardware_port(port)
                 })
                 .cloned()
-        } else {
-            None
         };
         let candidate = candidate.or_else(|| profiles::preferred_port(&self.ports).cloned());
         if let Some(port) = candidate {
@@ -341,18 +433,15 @@ impl Workspace {
         let current = self
             .ports
             .iter()
-            .find(|p| p.path == self.selected_port)
+            .find(|port| port.path == self.selected_port)
             .cloned();
         let Some(current) = current else {
             // The selected port vanished — flag the drop and wait for it.
             if !self.connection_dropped {
                 self.connection_dropped = true;
                 self.add_log(
-                    crate::LogKind::Warn,
-                    format!(
-                        "Connection lost on {}. Waiting for reconnect...",
-                        self.selected_port
-                    ),
+                    LogKind::Warn,
+                    format!("Connection lost on {}", self.selected_port),
                 );
             }
             return;
@@ -360,29 +449,20 @@ impl Workspace {
 
         if self.connection_dropped {
             self.connection_dropped = false;
-            self.add_log(
-                crate::LogKind::Ok,
-                format!("Reconnected to {}", current.path),
-            );
+            self.add_log(LogKind::Ok, format!("Reconnected to {}", current.path));
         }
 
-        self.detected_board = profiles::detect_board_type(&current);
-
-        // Keep the runtime/workspace in step with what's actually on this port
-        // (board swaps, a CIRCUITPY drive mounting, fresh-launch restore).
-        let profiles_list = self.detect_profiles_for(&current);
+        // Keep the runtime in step with what is actually on this port: board
+        // swaps, a CIRCUITPY drive mounting, a fresh-launch restore.
+        self.available_profiles = self.detect_profiles_for(&current);
         let next = profiles::resolve_profile_on_detect(
             self.active_profile.as_ref(),
-            &profiles_list,
+            &self.available_profiles,
             Some(&self.settings.last_profile_id),
             self.profile_manually_set,
         );
         if let Some(profile) = next {
-            if self
-                .active_profile
-                .as_ref()
-                .is_none_or(|p| p.id != profile.id)
-            {
+            if self.active_profile.as_ref() != Some(&profile) {
                 self.settings.last_profile_id = profile.id.clone();
                 self.settings.save();
                 self.active_profile = Some(profile);
@@ -391,7 +471,8 @@ impl Workspace {
     }
 
     fn detect_profiles_for(&self, port: &PortIdentity) -> Vec<ExecutionProfile> {
-        profiles::detect_profiles(port, self.circuit_python_drive.as_ref())
+        let board = boards::identify_board(Some(port), &self.settings.board_overrides);
+        profiles::detect_profiles(port, &board, self.circuit_python_drive.as_ref())
     }
 
     fn rebuild_profiles_for(&mut self, port: &PortIdentity) {
@@ -416,8 +497,7 @@ impl Workspace {
         self.connection_dropped = false;
         self.settings.last_port_path = path.clone();
         self.settings.save();
-        if let Some(port) = self.ports.iter().find(|p| p.path == path).cloned() {
-            self.detected_board = profiles::detect_board_type(&port);
+        if let Some(port) = self.ports.iter().find(|port| port.path == path).cloned() {
             self.rebuild_profiles_for(&port);
         }
     }
@@ -427,22 +507,28 @@ impl Workspace {
         let Some(port) = self.selected_port_identity() else {
             return;
         };
-        let key = boards::port_key(&port);
         self.settings
             .board_overrides
-            .insert(key, board_id.to_string());
+            .insert(boards::port_key(&port), board_id.to_string());
         self.settings.save();
+        // The board decides which runtimes exist, so the profile set has to
+        // be rebuilt rather than merely relabelled.
+        self.available_profiles = self.detect_profiles_for(&port);
+        if let Some(profile) = profiles::select_best_profile(&self.available_profiles) {
+            self.active_profile = Some(profile);
+            self.profile_manually_set = false;
+        }
         if let Some(board) = boards::board_by_id(board_id) {
-            self.detected_board = board.flash_board_type;
+            self.add_log(LogKind::Ok, format!("Board set to {}", board.name));
         }
     }
 
-    /// The user chose an execution profile explicitly.
+    /// The user chose a runtime explicitly.
     pub fn select_profile(&mut self, profile_id: &str) {
         if let Some(profile) = self
             .available_profiles
             .iter()
-            .find(|p| p.id == profile_id)
+            .find(|profile| profile.id == profile_id)
             .cloned()
         {
             self.settings.last_profile_id = profile.id.clone();
@@ -452,31 +538,245 @@ impl Workspace {
         }
     }
 
+    /// Replace the FQBN Anode uses for a board. An empty value restores the
+    /// catalog default.
+    pub fn set_fqbn_override(&mut self, board_id: &str, fqbn: &str) {
+        let fqbn = fqbn.trim();
+        let board = boards::board_by_id(board_id);
+        if fqbn.is_empty() || board.and_then(|board| board.fqbn) == Some(fqbn) {
+            if self.settings.fqbn_overrides.remove(board_id).is_some() {
+                self.add_log(LogKind::Ok, "Restored the default Arduino board name");
+            }
+        } else {
+            self.settings
+                .fqbn_overrides
+                .insert(board_id.to_string(), fqbn.to_string());
+            self.add_log(LogKind::Ok, format!("Arduino board name set to {fqbn}"));
+        }
+        self.settings.save();
+        // Re-seed the field from settings on the next sync.
+        self.fqbn_input_board = None;
+    }
+
+    /// Keep the FQBN field showing the selected board's value. Called from
+    /// render, so it only writes when the board actually changed.
+    pub fn sync_fqbn_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(board) = self.active_board() else {
+            return;
+        };
+        if self.fqbn_input_board == Some(board.id) {
+            return;
+        }
+        self.fqbn_input_board = Some(board.id);
+        let value = self.fqbn_for(board).unwrap_or_default();
+        self.fqbn_input.update(cx, |state, cx| {
+            state.set_value(value, window, cx);
+        });
+    }
+
+    /// Commit whatever the FQBN field currently holds.
+    pub fn commit_fqbn_input(&mut self, cx: &mut Context<Self>) {
+        let Some(board) = self.active_board() else {
+            return;
+        };
+        let value = self.fqbn_input.read(cx).value().to_string();
+        self.set_fqbn_override(board.id, &value);
+    }
+
+    // -- Board and runtime ---------------------------------------------------
+
+    pub fn selected_port_identity(&self) -> Option<PortIdentity> {
+        self.ports
+            .iter()
+            .find(|port| port.path == self.selected_port)
+            .cloned()
+    }
+
+    pub fn resolved_board(&self) -> BoardMatch {
+        boards::identify_board(
+            self.selected_port_identity().as_ref(),
+            &self.settings.board_overrides,
+        )
+    }
+
+    /// The board the active profile targets, falling back to USB detection.
+    pub fn active_board(&self) -> Option<&'static BoardDef> {
+        self.active_profile
+            .as_ref()
+            .and_then(ExecutionProfile::board)
+            .or_else(|| self.resolved_board().board)
+    }
+
+    pub fn active_runtime(&self) -> Runtime {
+        self.active_profile
+            .as_ref()
+            .map(|profile| profile.runtime)
+            .or_else(|| self.project_kind.runtime())
+            .unwrap_or(Runtime::MicroPython)
+    }
+
+    pub fn workspace_layout(&self) -> WorkspaceLayout {
+        profiles::workspace_layout(self.active_runtime())
+    }
+
+    pub fn is_connected(&self) -> bool {
+        !self.selected_port.is_empty()
+            && !self.connection_dropped
+            && self
+                .ports
+                .iter()
+                .any(|port| port.path == self.selected_port)
+    }
+
+    pub fn detected_board_label(&self) -> Option<String> {
+        self.active_board().map(|board| board.name.to_string())
+    }
+
+    /// The FQBN to compile with: the user's override, then the catalog's.
+    pub fn fqbn_for(&self, board: &BoardDef) -> Option<String> {
+        self.settings
+            .fqbn_overrides
+            .get(board.id)
+            .cloned()
+            .or_else(|| board.fqbn.map(str::to_string))
+    }
+
+    // -- Toolchain -----------------------------------------------------------
+
+    /// Probe every tool off the UI thread and cache the result.
+    pub fn refresh_tools(&mut self, cx: &mut Context<Self>) {
+        if self.tools_scanning {
+            return;
+        }
+        self.tools_scanning = true;
+        self._tools_task = Some(cx.spawn(async move |this, cx| {
+            let statuses = cx
+                .background_spawn(async { toolchain::probe_all(Tool::ALL) })
+                .await;
+            _ = this.update(cx, |this, cx| {
+                this.tool_statuses = statuses;
+                this.tools_scanning = false;
+                cx.notify();
+            });
+        }));
+    }
+
+    pub fn tool_status(&self, tool: Tool) -> Option<&ToolStatus> {
+        self.tool_statuses.iter().find(|status| status.tool == tool)
+    }
+
+    pub fn is_tool_available(&self, tool: Tool) -> bool {
+        self.tool_status(tool).is_some_and(ToolStatus::is_available)
+    }
+
+    /// The tools the current board and runtime need, and whether each is
+    /// present. Empty when no board is selected.
+    pub fn required_tools(&self) -> Vec<(Tool, bool)> {
+        let Some(board) = self.active_board() else {
+            return Vec::new();
+        };
+        toolchain::required_tools(board, self.active_runtime())
+            .into_iter()
+            .map(|tool| (tool, self.is_tool_available(tool)))
+            .collect()
+    }
+
+    /// The tools that are needed but missing, which is what blocks a build.
+    pub fn missing_tools(&self) -> Vec<Tool> {
+        self.required_tools()
+            .into_iter()
+            .filter(|(_, available)| !available)
+            .map(|(tool, _)| tool)
+            .collect()
+    }
+
+    /// Install a tool. `drain_background_events` re-probes once the job ends,
+    /// so the toolchain list reflects the new state without another command.
+    pub fn install_tool(&mut self, tool: Tool) {
+        self.add_log(LogKind::Install, format!("Installing {}…", tool.name()));
+        self.spawn_device_work(move |emit| toolchain::install(tool, emit));
+    }
+
+    /// Install the `arduino-cli` core the active board compiles with.
+    pub fn install_board_core(&mut self) {
+        let Some(board) = self.active_board() else {
+            self.add_log(LogKind::Warn, "Select a board first");
+            return;
+        };
+        if board.core.is_none() {
+            self.add_log(
+                LogKind::Warn,
+                format!("{} has no Arduino core in Anode", board.name),
+            );
+            return;
+        }
+        self.add_log(
+            LogKind::Install,
+            format!("Installing the Arduino core for {}…", board.name),
+        );
+        self.spawn_device_work(move |emit| device::arduino_core_install(board, emit));
+    }
+
     // -- Logging -------------------------------------------------------------
 
-    pub fn add_log(&mut self, kind: crate::LogKind, message: impl Into<String>) {
+    pub fn add_log(&mut self, kind: LogKind, message: impl Into<SharedString>) {
         self.log_entries.push(LogEntry {
             id: self.next_log_id,
             kind,
+            time: chrono::Local::now().format("%H:%M:%S").to_string().into(),
             message: message.into(),
         });
         // Bound the log so a chatty flash session can't grow it forever.
-        if self.log_entries.len() > 1000 {
-            let drop = self.log_entries.len() - 1000;
-            self.log_entries.drain(..drop);
+        if self.log_entries.len() > 2000 {
+            let excess = self.log_entries.len() - 2000;
+            self.log_entries.drain(..excess);
         }
         self.next_log_id += 1;
     }
 
+    pub fn clear_log(&mut self) {
+        self.log_entries.clear();
+    }
+
+    pub fn set_log_filter(&mut self, filter: LogFilter) {
+        self.log_filter = filter;
+    }
+
+    /// The entries the current filter shows.
+    pub fn visible_log_entries(&self) -> Vec<LogEntry> {
+        match self.log_filter {
+            LogFilter::All => self.log_entries.clone(),
+            LogFilter::Problems => self
+                .log_entries
+                .iter()
+                .filter(|entry| entry.kind.is_problem())
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// The whole log as text, for the Copy button.
+    pub fn log_as_text(&self) -> String {
+        self.visible_log_entries()
+            .iter()
+            .map(|entry| format!("{} {}", entry.time, entry.message))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Classify a progress line from a device worker. Workers mark their own
+    /// lines with a prefix; anything else is ordinary tool output.
     fn log_from_progress(&mut self, message: &str) {
         let (kind, message) = if let Some(rest) = message.strip_prefix("[ERROR]") {
-            (crate::LogKind::Error, rest.trim())
+            (LogKind::Error, rest.trim())
         } else if let Some(rest) = message.strip_prefix("[WARN]") {
-            (crate::LogKind::Warn, rest.trim())
+            (LogKind::Warn, rest.trim())
         } else if let Some(rest) = message.strip_prefix("[OK]") {
-            (crate::LogKind::Ok, rest.trim())
+            (LogKind::Ok, rest.trim())
+        } else if looks_like_an_error(message) {
+            (LogKind::Error, message)
         } else {
-            (crate::LogKind::Flash, message)
+            (LogKind::Flash, message)
         };
         self.add_log(kind, message.to_string());
     }
@@ -484,40 +784,73 @@ impl Workspace {
     // -- Project -------------------------------------------------------------
 
     pub fn open_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_project_from_drain(path);
+        self.open_project_from_drain(path, cx);
         self.sync_editor_to_current_file(window, cx);
     }
 
     /// Load a project without window access; the editor syncs on the next
     /// render via `needs_editor_sync`.
-    fn open_project_from_drain(&mut self, path: PathBuf) {
-        self.needs_editor_sync = true;
+    fn open_project_from_drain(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         match project::load_project(&path) {
             Ok(files) => {
                 let name = path
                     .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
+                    .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_else(|| "Project".into());
-                self.add_log(crate::LogKind::Ok, format!("Opened {name}"));
+                let kind = project::detect_project_kind(&path);
+                self.add_log(LogKind::Ok, format!("Opened {name} · {}", kind.label()));
                 self.settings
                     .add_recent_project(path.to_string_lossy().to_string(), name.clone());
                 self.settings.save();
+                self.terminal
+                    .update(cx, |terminal, cx| terminal.open_directory(Some(&path), cx));
+                self.platformio_environments = if kind == ProjectKind::PlatformIo {
+                    device::platformio_environments(&path)
+                } else {
+                    Vec::new()
+                };
                 self.project_path = Some(path);
                 self.project_name = name;
+                self.project_kind = kind;
                 self.project_files = files;
                 self.open_tabs.clear();
                 self.active_tab = None;
-                self.current_file = self.project_files.first().cloned();
+                // Open the file the project is about, not merely the first one
+                // alphabetically.
+                self.current_file = pick_entry_file(&self.project_files, kind);
                 self.is_dirty = false;
                 if let Some(file) = self.current_file.clone() {
                     self.open_tab_for(file);
                 }
+                // A project's own kind is a stronger signal than a USB guess.
+                self.adopt_project_runtime();
                 self.needs_editor_sync = true;
             }
-            Err(e) => self.add_log(
-                crate::LogKind::Error,
-                format!("Failed to open project folder: {e}"),
+            Err(error) => self.add_log(
+                LogKind::Error,
+                format!("Could not open that folder: {error}"),
             ),
+        }
+    }
+
+    /// Switch the active runtime to the one the opened project is written
+    /// for, when the board supports it and the user has not pinned a choice.
+    fn adopt_project_runtime(&mut self) {
+        let Some(runtime) = self.project_kind.runtime() else {
+            return;
+        };
+        if self.profile_manually_set {
+            return;
+        }
+        if let Some(profile) = self
+            .available_profiles
+            .iter()
+            .find(|profile| profile.runtime == runtime)
+            .cloned()
+        {
+            self.settings.last_profile_id = profile.id.clone();
+            self.settings.save();
+            self.active_profile = Some(profile);
         }
     }
 
@@ -528,9 +861,16 @@ impl Workspace {
             self.pending_open_path = Some(path);
         } else {
             self.add_log(
-                crate::LogKind::Error,
-                format!("Project folder no longer exists: {}", path.display()),
+                LogKind::Error,
+                format!("That folder no longer exists: {}", path.display()),
             );
+        }
+    }
+
+    pub fn reload_project(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.project_path.clone() {
+            self.pending_open_path = Some(path);
+            cx.notify();
         }
     }
 
@@ -555,7 +895,7 @@ impl Workspace {
     }
 
     fn open_tab_for(&mut self, file: ProjectFile) {
-        if !self.open_tabs.iter().any(|t| t.path == file.path) {
+        if !self.open_tabs.iter().any(|tab| tab.path == file.path) {
             self.open_tabs.push(OpenTab {
                 path: file.path.clone(),
                 name: file.name.clone(),
@@ -567,7 +907,12 @@ impl Workspace {
     }
 
     pub fn select_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(file) = self.project_files.iter().find(|f| f.path == path).cloned() {
+        if let Some(file) = self
+            .project_files
+            .iter()
+            .find(|file| file.path == path)
+            .cloned()
+        {
             self.open_tab_for(file);
             self.sync_editor_to_current_file(window, cx);
         }
@@ -580,19 +925,21 @@ impl Workspace {
         }
     }
 
-    pub fn close_tab(&mut self, index: usize) {
+    pub fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.open_tabs.get(index) else {
             return;
         };
         let path = tab.path.clone();
-        self.open_tabs.retain(|t| t.path != path);
+        self.open_tabs.retain(|tab| tab.path != path);
         if self.active_tab.as_ref() == Some(&path) {
-            // Activate the last remaining tab, if any.
-            self.active_tab = self.open_tabs.last().map(|t| t.path.clone());
-            self.current_file = self
-                .active_tab
-                .as_ref()
-                .and_then(|p| self.project_files.iter().find(|f| &f.path == p).cloned());
+            self.active_tab = self.open_tabs.last().map(|tab| tab.path.clone());
+            self.current_file = self.active_tab.as_ref().and_then(|path| {
+                self.project_files
+                    .iter()
+                    .find(|file| &file.path == path)
+                    .cloned()
+            });
+            self.sync_editor_to_current_file(window, cx);
         }
     }
 
@@ -603,21 +950,18 @@ impl Workspace {
         let content = self
             .current_file
             .as_ref()
-            .map(|f| f.content.clone())
+            .map(|file| file.content.clone())
             .unwrap_or_default();
-        let language_name = match self
+        let highlighter = self
             .current_file
             .as_ref()
-            .map(|f| f.language)
+            .map(|file| file.language)
             .unwrap_or(Language::Python)
-        {
-            Language::Python => "python",
-            Language::Arduino => "cpp",
-        };
-        self.editor_file = self.current_file.as_ref().map(|f| f.path.clone());
+            .highlighter();
+        self.editor_file = self.current_file.as_ref().map(|file| file.path.clone());
         self.editor.update(cx, |state, cx| {
             state.set_value(content, window, cx);
-            state.set_highlighter(language_name, cx);
+            state.set_highlighter(highlighter, cx);
         });
         self.editor_syncing = false;
     }
@@ -626,7 +970,7 @@ impl Workspace {
 
     pub fn save_current_file(&mut self) {
         let Some(file) = self.current_file.clone() else {
-            self.add_log(crate::LogKind::Warn, "No file open");
+            self.add_log(LogKind::Warn, "No file is open");
             return;
         };
         if self.save_file(&file, false) {
@@ -643,14 +987,14 @@ impl Workspace {
         match project::write_file(&file.path, &file.content) {
             Ok(()) => {
                 if !silent {
-                    self.add_log(crate::LogKind::Ok, format!("{} saved", file.name));
+                    self.add_log(LogKind::Ok, format!("Saved {}", file.name));
                 }
                 true
             }
-            Err(e) => {
+            Err(error) => {
                 self.add_log(
-                    crate::LogKind::Error,
-                    format!("Failed to save {}: {e}", file.name),
+                    LogKind::Error,
+                    format!("Could not save {}: {error}", file.name),
                 );
                 false
             }
@@ -658,15 +1002,20 @@ impl Workspace {
     }
 
     pub fn save_all_files(&mut self) {
-        if self.project_files.is_empty() {
+        let dirty: Vec<ProjectFile> = self
+            .project_files
+            .iter()
+            .filter(|file| {
+                self.open_tabs
+                    .iter()
+                    .any(|tab| tab.path == file.path && tab.is_dirty)
+            })
+            .cloned()
+            .collect();
+        if dirty.is_empty() {
             return;
         }
-        let files = self.project_files.clone();
-        self.add_log(
-            crate::LogKind::Info,
-            format!("Saving {} project files locally...", files.len()),
-        );
-        for file in &files {
+        for file in &dirty {
             if !self.save_file(file, true) {
                 return;
             }
@@ -675,180 +1024,315 @@ impl Workspace {
         for tab in &mut self.open_tabs {
             tab.is_dirty = false;
         }
-        self.add_log(
-            crate::LogKind::Ok,
-            format!("Saved {} files locally.", files.len()),
-        );
+        self.add_log(LogKind::Ok, format!("Saved {} files", dirty.len()));
     }
 
-    // -- Run / upload / stop -------------------------------------------------
+    // -- Run / build / upload ------------------------------------------------
 
-    pub fn selected_port_identity(&self) -> Option<PortIdentity> {
-        self.ports
-            .iter()
-            .find(|p| p.path == self.selected_port)
-            .cloned()
-    }
-
-    pub fn is_circuit_python(&self) -> bool {
-        self.active_profile
-            .as_ref()
-            .is_some_and(|p| p.runtime == boards::Runtime::CircuitPython)
-    }
-
-    pub fn is_arduino(&self) -> bool {
-        self.active_profile
-            .as_ref()
-            .is_some_and(|p| p.runtime == boards::Runtime::Arduino)
-    }
-
-    pub fn workspace_layout(&self) -> WorkspaceLayout {
-        profiles::workspace_layout(self.is_arduino())
-    }
-
+    /// Run the open file on the board. Only the interpreted runtimes can do
+    /// this; the compiled ones build instead.
     pub fn run_code(&mut self) {
+        if !self.active_runtime().is_interpreted() {
+            self.build_project();
+            return;
+        }
         let Some(file) = self.current_file.clone() else {
-            self.add_log(crate::LogKind::Warn, "No file open");
+            self.add_log(LogKind::Warn, "No file is open");
             return;
         };
+        if file.language != Language::Python {
+            self.add_log(LogKind::Warn, format!("{} is not a Python file", file.name));
+            return;
+        }
 
         // CircuitPython deploys to the drive instead of running over serial.
-        // The board auto-reloads and runs code.py; output streams to the REPL.
-        if self.is_circuit_python() {
+        // The board auto-reloads and runs code.py; output reaches the REPL.
+        if self.active_runtime() == Runtime::CircuitPython {
             self.deploy_circuit_python(vec![file]);
             return;
         }
 
-        if self.selected_port.is_empty() {
-            self.add_log(crate::LogKind::Warn, "No board connected");
+        let Some(port) = self.require_port() else {
             return;
-        }
-        let port = self.selected_port.clone();
-
+        };
         if !self.save_file(&file, true) {
             return;
         }
-        self.add_log(
-            crate::LogKind::Info,
-            format!("Running {} on {}...", file.name, port),
-        );
+        self.add_log(LogKind::Info, format!("Running {} on {port}", file.name));
         self.spawn_device_work(move |emit| device::run_code(&port, &file.content, emit));
     }
 
+    /// Compile the project without touching the board.
+    pub fn build_project(&mut self) {
+        let runtime = self.active_runtime();
+        if runtime.is_interpreted() {
+            self.add_log(
+                LogKind::Warn,
+                format!(
+                    "{} runs source directly; there is nothing to build",
+                    runtime.label()
+                ),
+            );
+            return;
+        }
+        let Some(project_path) = self.project_path.clone() else {
+            self.add_log(LogKind::Warn, "Open a project folder first");
+            return;
+        };
+        if let Some(missing) = self.first_missing_tool() {
+            return self.report_missing_tool(missing);
+        }
+        self.save_all_files();
+
+        match (runtime, self.project_kind) {
+            (Runtime::Arduino, _) => {
+                let Some(fqbn) = self.require_fqbn() else {
+                    return;
+                };
+                self.add_log(LogKind::Info, format!("Compiling for {fqbn}"));
+                self.spawn_device_work(move |emit| {
+                    device::arduino_compile(&project_path, &fqbn, emit)
+                });
+            }
+            (Runtime::Native, ProjectKind::EspIdf) => {
+                let Some(target) = self.require_idf_target() else {
+                    return;
+                };
+                self.add_log(LogKind::Info, format!("Building with ESP-IDF for {target}"));
+                self.spawn_device_work(move |emit| device::idf_build(&project_path, &target, emit));
+            }
+            (Runtime::Native, _) => {
+                let environment = self.platformio_environments.first().cloned();
+                self.add_log(LogKind::Info, "Building with PlatformIO");
+                self.spawn_device_work(move |emit| {
+                    device::platformio_build(&project_path, environment.as_deref(), emit)
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Put the project on the board, whichever runtime it uses.
     pub fn upload_project(&mut self) {
+        match self.active_runtime() {
+            Runtime::CircuitPython => {
+                let files: Vec<ProjectFile> = self
+                    .project_files
+                    .iter()
+                    .filter(|file| file.language.is_device_source())
+                    .cloned()
+                    .collect();
+                if files.is_empty() {
+                    self.add_log(LogKind::Warn, "This project has no Python files");
+                    return;
+                }
+                self.deploy_circuit_python(files);
+            }
+            Runtime::MicroPython => self.upload_micropython(),
+            Runtime::Arduino => self.upload_arduino(),
+            Runtime::Native => self.upload_native(),
+        }
+    }
+
+    fn upload_micropython(&mut self) {
         let files: Vec<ProjectFile> = self
             .project_files
             .iter()
-            .filter(|f| matches!(f.language, Language::Python | Language::Arduino))
+            .filter(|file| file.language.is_device_source())
             .cloned()
             .collect();
         if files.is_empty() {
-            self.add_log(crate::LogKind::Warn, "No files to upload");
+            self.add_log(LogKind::Warn, "This project has no Python files");
             return;
         }
-
-        if self.is_circuit_python() {
-            self.deploy_circuit_python(files);
+        let Some(port) = self.require_port() else {
             return;
+        };
+        if let Some(missing) = self.first_missing_tool() {
+            return self.report_missing_tool(missing);
         }
-
-        if self.selected_port.is_empty() {
-            self.add_log(crate::LogKind::Warn, "No board connected");
-            return;
-        }
-        let port = self.selected_port.clone();
         self.save_all_files();
         let total = files.len();
-        self.add_log(
-            crate::LogKind::Info,
-            format!("Deploying {total} files to {port}..."),
-        );
+        self.add_log(LogKind::Info, format!("Uploading {total} files to {port}"));
         self.spawn_device_work(move |emit| {
             for file in &files {
-                emit(DeviceEvent::Progress(format!(
-                    "[FLASH] Uploading {} …",
-                    file.name
-                )));
                 device::upload_code(&port, &file.name, &file.content, emit)?;
             }
             emit(DeviceEvent::Progress(format!(
-                "[OK] Deployment complete. {total} files synced to board."
+                "[OK] {total} files are on the board"
             )));
             Ok(())
         });
     }
 
-    fn deploy_circuit_python(&mut self, files: Vec<ProjectFile>) {
-        let drive = self.circuit_python_drive.clone().unwrap_or_default();
-        let total = files.len();
+    fn upload_arduino(&mut self) {
+        let Some(project_path) = self.project_path.clone() else {
+            self.add_log(LogKind::Warn, "Open a sketch folder first");
+            return;
+        };
+        let Some(port) = self.require_port() else {
+            return;
+        };
+        if let Some(missing) = self.first_missing_tool() {
+            return self.report_missing_tool(missing);
+        }
+        let Some(fqbn) = self.require_fqbn() else {
+            return;
+        };
+        self.save_all_files();
+        self.add_log(LogKind::Info, format!("Uploading to {port} for {fqbn}"));
+        self.spawn_device_work(move |emit| {
+            device::arduino_upload(&port, &project_path, &fqbn, emit)
+        });
+    }
+
+    fn upload_native(&mut self) {
+        let Some(project_path) = self.project_path.clone() else {
+            self.add_log(LogKind::Warn, "Open a project folder first");
+            return;
+        };
+        let Some(port) = self.require_port() else {
+            return;
+        };
+        if let Some(missing) = self.first_missing_tool() {
+            return self.report_missing_tool(missing);
+        }
+        self.save_all_files();
+        if self.project_kind == ProjectKind::EspIdf {
+            let Some(target) = self.require_idf_target() else {
+                return;
+            };
+            self.add_log(LogKind::Info, format!("Flashing {target} with ESP-IDF"));
+            self.spawn_device_work(move |emit| {
+                device::idf_flash(&project_path, &target, &port, emit)
+            });
+            return;
+        }
+        let environment = self.platformio_environments.first().cloned();
         self.add_log(
-            crate::LogKind::Info,
-            format!("Copying {total} files to CIRCUITPY…"),
+            LogKind::Info,
+            format!("Uploading to {port} with PlatformIO"),
         );
         self.spawn_device_work(move |emit| {
+            device::platformio_upload(&project_path, environment.as_deref(), &port, emit)
+        });
+    }
+
+    fn deploy_circuit_python(&mut self, files: Vec<ProjectFile>) {
+        let drive = self.circuit_python_drive.clone().unwrap_or_default();
+        if !drive.present {
+            self.add_log(
+                LogKind::Warn,
+                "No CIRCUITPY drive is mounted. Reconnect the board, or flash CircuitPython first.",
+            );
+            return;
+        }
+        self.save_all_files();
+        let total = files.len();
+        self.add_log(LogKind::Info, format!("Copying {total} files to CIRCUITPY"));
+        self.spawn_device_work(move |emit| {
             for file in &files {
-                emit(DeviceEvent::Progress(format!(
-                    "[FLASH] Copying {} to CIRCUITPY…",
-                    file.name
-                )));
-                device::circuitpython_deploy(&drive, &file.name, &file.content)?;
+                let written = device::circuitpython_deploy(&drive, &file.name, &file.content)?;
+                emit(DeviceEvent::Progress(format!("Copied {written}")));
             }
             emit(DeviceEvent::Progress(format!(
-                "[OK] Deployment complete. {total} files copied to CIRCUITPY."
+                "[OK] {total} files copied; the board restarts code.py on its own"
             )));
             Ok(())
         });
     }
 
     pub fn stop_code(&mut self) {
-        if self.selected_port.is_empty() {
-            self.add_log(crate::LogKind::Warn, "No board connected");
+        let Some(port) = self.require_port() else {
             return;
-        }
-        let port = self.selected_port.clone();
-        self.add_log(crate::LogKind::Warn, "Stopping execution...");
+        };
+        self.add_log(LogKind::Warn, "Stopping the running program");
         self.spawn_device_work(move |emit| device::stop_code(&port, emit));
     }
 
-    pub fn arduino_compile(&mut self) {
-        let Some(project_path) = self.project_path.clone() else {
-            self.add_log(crate::LogKind::Warn, "No project open");
+    /// Flash firmware onto the active board.
+    pub fn flash_firmware(&mut self, source: FirmwareSource) {
+        let Some(board) = self.active_board() else {
+            self.add_log(LogKind::Warn, "Select a board first");
             return;
         };
-        let fqbn = self
-            .active_profile
-            .as_ref()
-            .and_then(|p| p.fqbn.clone())
-            .unwrap_or_else(|| "arduino:avr:uno".into());
-        self.add_log(
-            crate::LogKind::Info,
-            format!("Compiling with arduino-cli ({fqbn})..."),
-        );
-        self.spawn_device_work(move |emit| device::arduino_compile(&project_path, &fqbn, emit));
-    }
-
-    pub fn arduino_upload(&mut self) {
-        let Some(project_path) = self.project_path.clone() else {
-            self.add_log(crate::LogKind::Warn, "No project open");
-            return;
-        };
-        if self.selected_port.is_empty() {
-            self.add_log(crate::LogKind::Warn, "No board connected");
-            return;
-        }
         let port = self.selected_port.clone();
-        let fqbn = self
-            .active_profile
-            .as_ref()
-            .and_then(|p| p.fqbn.clone())
-            .unwrap_or_else(|| "arduino:avr:uno".into());
         self.add_log(
-            crate::LogKind::Info,
-            format!("Uploading to {port} ({fqbn})..."),
+            LogKind::Info,
+            format!("Flashing {} · {}", board.name, source.label()),
         );
         self.spawn_device_work(move |emit| {
-            device::arduino_upload(&port, &project_path, &fqbn, emit)
+            let outcome = device::flash_firmware(&port, board, source, emit);
+            if outcome.success {
+                Ok(())
+            } else {
+                Err(outcome.message())
+            }
         });
+    }
+
+    // -- Preconditions -------------------------------------------------------
+
+    /// The selected port, or a log line saying why there isn't one.
+    fn require_port(&mut self) -> Option<String> {
+        if self.selected_port.is_empty() {
+            self.add_log(LogKind::Warn, "Connect a board over USB first");
+            return None;
+        }
+        Some(self.selected_port.clone())
+    }
+
+    fn require_fqbn(&mut self) -> Option<String> {
+        let board = self.active_board()?;
+        match self.fqbn_for(board) {
+            Some(fqbn) => Some(fqbn),
+            None => {
+                self.add_log(
+                    LogKind::Error,
+                    format!(
+                        "{} has no Arduino board name in Anode. Set one in the board panel.",
+                        board.name
+                    ),
+                );
+                None
+            }
+        }
+    }
+
+    fn require_idf_target(&mut self) -> Option<String> {
+        let board = self.active_board();
+        match board.and_then(|board| board.idf_target()) {
+            Some(target) => Some(target.to_string()),
+            None => {
+                self.add_log(
+                    LogKind::Error,
+                    "ESP-IDF only builds for Espressif chips. Select an Espressif board, or build with PlatformIO.",
+                );
+                None
+            }
+        }
+    }
+
+    fn first_missing_tool(&self) -> Option<Tool> {
+        // ESP-IDF and PlatformIO are alternatives for a native build, so a
+        // missing one is only fatal when the other is missing too.
+        let missing = self.missing_tools();
+        if self.active_runtime() == Runtime::Native {
+            let has_either =
+                self.is_tool_available(Tool::PlatformIo) || self.is_tool_available(Tool::EspIdf);
+            if has_either {
+                return None;
+            }
+            return missing.into_iter().next();
+        }
+        missing.into_iter().next()
+    }
+
+    fn report_missing_tool(&mut self, tool: Tool) {
+        self.add_log(
+            LogKind::Error,
+            format!("{} is not installed. {}", tool.name(), tool.install_hint()),
+        );
     }
 
     /// Run device I/O on a background thread; its progress lines and result
@@ -858,7 +1342,7 @@ impl Workspace {
         work: impl FnOnce(&mut dyn FnMut(DeviceEvent)) -> Result<(), String> + Send + 'static,
     ) {
         if self.device_busy {
-            self.add_log(crate::LogKind::Warn, "Another device operation is running");
+            self.add_log(LogKind::Warn, "Another device operation is still running");
             return;
         }
         let key = self
@@ -876,26 +1360,26 @@ impl Workspace {
                 }
             }
         };
-        let (tx, rx) = std::sync::mpsc::channel::<BackgroundOutcome>();
-        self.device_events = Some(rx);
+        let (sender, receiver) = std::sync::mpsc::channel::<BackgroundOutcome>();
+        self.device_events = Some(receiver);
         self.device_busy = true;
         std::thread::spawn(move || {
             let _lease = lease;
             let mut sink = |event: DeviceEvent| {
                 let DeviceEvent::Progress(message) = event;
-                let _ = tx.send(BackgroundOutcome::Progress(message));
+                let _ = sender.send(BackgroundOutcome::Progress(message));
             };
             let result = work(&mut sink);
-            let _ = tx.send(BackgroundOutcome::Finished(result));
+            let _ = sender.send(BackgroundOutcome::Finished(result));
         });
     }
 
-    /// Deliver background progress/results to the log. Called from render and
-    /// from the poll tick, so results arrive even between user actions.
+    /// Deliver background progress and results to the log. Called from render
+    /// and from the poll tick, so results arrive even between user actions.
     pub fn drain_background_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut changed = false;
         if let Some(path) = self.pending_open_path.take() {
-            self.open_project_from_drain(path);
+            self.open_project_from_drain(path, cx);
             self.sync_editor_to_current_file(window, cx);
             changed = true;
         }
@@ -904,11 +1388,13 @@ impl Workspace {
             self.sync_editor_to_current_file(window, cx);
             changed = true;
         }
+        let mut finished = false;
         while self.device_events.is_some() {
-            let Some(rx) = &self.device_events else { break };
-            let event = match rx.try_recv() {
-                Ok(event) => event,
-                Err(_) => break,
+            let Some(receiver) = &self.device_events else {
+                break;
+            };
+            let Ok(event) = receiver.try_recv() else {
+                break;
             };
             match event {
                 BackgroundOutcome::Progress(message) => {
@@ -916,189 +1402,128 @@ impl Workspace {
                     changed = true;
                 }
                 BackgroundOutcome::Finished(result) => {
-                    if let Err(e) = result {
-                        if !e.is_empty() {
-                            self.add_log(crate::LogKind::Error, e);
+                    if let Err(error) = result {
+                        for line in error.lines().filter(|line| !line.trim().is_empty()) {
+                            self.add_log(LogKind::Error, line.to_string());
                         }
                     }
                     self.device_busy = false;
                     self.device_events = None;
+                    finished = true;
                     changed = true;
                     break;
                 }
             }
+        }
+        if finished {
+            // An install or a core download changes what is available, and a
+            // re-probe is cheap next to the job that just ran.
+            self.refresh_tools(cx);
+        }
+        if self.device_busy {
+            if self._device_poll.is_none() {
+                self._device_poll = Some(cx.spawn(async move |this, cx| loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(80))
+                        .await;
+                    let still_running = this
+                        .update(cx, |this, cx| {
+                            cx.notify();
+                            this.device_busy
+                        })
+                        .unwrap_or(false);
+                    if !still_running {
+                        break;
+                    }
+                }));
+            }
+        } else {
+            self._device_poll = None;
         }
         if changed {
             cx.notify();
         }
     }
 
-    // -- Flash ---------------------------------------------------------------
-
-    /// The flash button: detect the board kind and open the flash dialog.
-    pub fn begin_flash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_port.is_empty() {
-            self.add_log(crate::LogKind::Warn, "Please select a board first.");
-            return;
-        }
-        // Detect from the selected port (falling back to its path alone).
-        let detected = self
-            .resolved_board()
-            .board
-            .map(|board| board.flash_board_type)
-            .or_else(|| {
-                self.selected_port_identity()
-                    .map(|p| profiles::detect_board_type(&p))
-            })
-            .unwrap_or_else(|| {
-                profiles::detect_board_type(&PortIdentity {
-                    path: self.selected_port.clone(),
-                    ..Default::default()
-                })
-            });
-        self.flash_board_choice = detected;
-        if detected == BoardType::Unknown {
-            self.add_log(
-                crate::LogKind::Warn,
-                format!(
-                    "Could not auto-detect board on {}. Select manually in the dialog.",
-                    self.selected_port
-                ),
-            );
-        } else {
-            self.add_log(
-                crate::LogKind::Info,
-                format!("Detected {} on {}", detected.label(), self.selected_port),
-            );
-        }
-        cx.notify();
-        self.open_flash_dialog(window, cx);
-    }
-
-    /// Confirm the flash dialog: verify the tool, then flash on a background
-    /// thread.
-    pub fn confirm_flash(&mut self, board_type: BoardType) {
-        if self.selected_port.is_empty() {
-            self.add_log(crate::LogKind::Warn, "Please select a board first.");
-            return;
-        }
-        let port_path = self.selected_port.clone();
-        if let Some(tool) = board_type.tool() {
-            let tool_name = tool.to_string();
-            let available = std::thread::spawn(move || device::tool_available(&tool_name))
-                .join()
-                .unwrap_or(false);
-            if !available {
-                self.add_log(
-                    crate::LogKind::Error,
-                    format!("{tool} not found. Install it to flash this board."),
-                );
-                return;
-            }
-        }
-        self.add_log(
-            crate::LogKind::Info,
-            format!("Flashing {} firmware on {port_path}...", board_type.label()),
-        );
-        let variant = self
-            .resolved_board()
-            .board
-            .filter(|board| board.flash_board_type == board_type)
-            .and_then(|board| board.mpy_variant);
-        self.spawn_device_work(move |emit| {
-            let outcome = device::flash_firmware(&port_path, board_type, variant, emit);
-            if outcome.success {
-                Ok(())
-            } else {
-                Err(outcome.error.unwrap_or_else(|| "Flash failed.".to_string()))
-            }
-        });
-    }
-
-    /// Install a missing flashing tool (esptool / arduino-cli).
-    pub fn install_tool(&mut self, tool: &str) {
-        let tool = tool.to_string();
-        self.add_log(crate::LogKind::Install, format!("Installing {tool}…"));
-        self.spawn_device_work(move |emit| {
-            device::install_tool(&tool, emit)?;
-            emit(DeviceEvent::Progress(
-                "[OK] Tool installed successfully".into(),
-            ));
-            Ok(())
-        });
-    }
-
     /// Open the native folder picker and load the chosen directory.
     pub fn open_folder_dialog(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let rx = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+        let paths = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Open Project Folder".into()),
+            prompt: Some("Open".into()),
         });
         cx.spawn(async move |this, cx: &mut gpui_kit::AsyncApp| {
-            let paths = rx.await;
             let picked = paths
+                .await
                 .ok()
                 .and_then(|result| result.ok())
                 .flatten()
                 .and_then(|paths| paths.into_iter().next());
             if let Some(path) = picked {
-                this.update(cx, |this, cx| {
+                _ = this.update(cx, |this, cx| {
                     this.pending_open_path = Some(path);
                     cx.notify();
-                })
-                .ok();
+                });
             }
         })
         .detach();
     }
 
-    /// Create a project from a welcome-screen template in a new sibling
-    /// directory of the last-used project, then open it.
+    /// Ask for a firmware image on disk and flash it to the active board.
+    pub fn pick_firmware_file(&mut self, cx: &mut Context<Self>) {
+        if self.active_board().is_none() {
+            self.add_log(LogKind::Warn, "Select a board first");
+            return;
+        }
+        let paths = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Flash".into()),
+        });
+        cx.spawn(async move |this, cx: &mut gpui_kit::AsyncApp| {
+            let picked = paths
+                .await
+                .ok()
+                .and_then(|result| result.ok())
+                .flatten()
+                .and_then(|paths| paths.into_iter().next());
+            if let Some(path) = picked {
+                _ = this.update(cx, |this, cx| {
+                    this.flash_firmware(FirmwareSource::LocalFile(path));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Create a project from a template under ~/Documents/Anode, then open it.
     pub fn create_from_template(&mut self, template_id: &str, cx: &mut Context<Self>) {
-        let Some(template) = crate::project::TEMPLATES
+        let Some(template) = project::TEMPLATES
             .iter()
-            .find(|t| t.id == template_id)
+            .find(|template| template.id == template_id)
         else {
             return;
         };
-        // Create the project under ~/Documents/Anode/<template-id>.
         let base = dirs::document_dir()
             .unwrap_or_else(std::env::temp_dir)
             .join("Anode");
-        let project_dir = base.join(template.name.to_lowercase().replace(' ', "-"));
-        let main_file = crate::project::template_main_file(template);
+        let project_dir = unique_directory(&base, &template.directory_name());
 
-        let dir = project_dir.clone();
-        let file_name = main_file.to_string();
-        let code = template.code.to_string();
-        let result =
-            std::thread::spawn(move || crate::project::create_file(&dir, &file_name, &code)).join();
-        match result {
-            Ok(Ok(_path)) => {
-                let name = project_dir
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "Project".into());
+        match project::create_from_template(&project_dir, template) {
+            Ok(_) => {
                 self.add_log(
-                    crate::LogKind::Ok,
-                    format!("Created {} from {}", name, template.name),
+                    LogKind::Ok,
+                    format!("Created {} from {}", project_dir.display(), template.name),
                 );
                 self.pending_open_path = Some(project_dir);
             }
-            Ok(Err(e)) => {
-                self.add_log(
-                    crate::LogKind::Error,
-                    format!("Failed to create project: {e}"),
-                );
-            }
-            Err(_) => {
-                self.add_log(
-                    crate::LogKind::Error,
-                    "Failed to create project".to_string(),
-                );
-            }
+            Err(error) => self.add_log(
+                LogKind::Error,
+                format!("Could not create the project: {error}"),
+            ),
         }
         cx.notify();
     }
@@ -1106,14 +1531,9 @@ impl Workspace {
     // -- REPL ----------------------------------------------------------------
 
     pub fn repl_connect(&mut self) {
-        if self.selected_port.is_empty() {
-            self.add_log(
-                crate::LogKind::Warn,
-                "Select a port before opening the REPL",
-            );
+        let Some(port) = self.require_port() else {
             return;
-        }
-        let port = self.selected_port.clone();
+        };
         if self.repl_connected {
             return;
         }
@@ -1138,9 +1558,10 @@ impl Workspace {
                     .push_str(&format!("--- Connected to {port} ---\n"));
                 self.bottom_mode = BottomMode::Repl;
             }
-            Err(e) => {
+            Err(error) => {
                 self.repl_output
-                    .push_str(&format!("[ERROR] Connection failed: {e}\n"));
+                    .push_str(&format!("[ERROR] Could not connect: {error}\n"));
+                self.add_log(LogKind::Error, format!("REPL: {error}"));
             }
         }
     }
@@ -1157,11 +1578,31 @@ impl Workspace {
             return;
         }
         if !line.trim().is_empty() {
+            // Keep one copy of a repeated command, at the end where Up finds
+            // it first.
+            self.repl_history.retain(|entry| entry != &line);
             self.repl_history.push(line.clone());
+            self.repl_history.truncate(200);
         }
+        self.repl_history_cursor = None;
         if let Some(connection) = &self.repl_connection {
             connection.send(format!("{line}\r\n").as_bytes());
         }
+    }
+
+    /// Step through REPL history, as a terminal's Up and Down keys do.
+    ///
+    /// Returns the line the input should now show, or `None` when the cursor
+    /// cannot move — already at the oldest entry, or already back at the line
+    /// being typed. Stepping past the newest entry restores the empty line.
+    pub fn repl_history_step(&mut self, direction: HistoryStep) -> Option<String> {
+        let next = step_history(self.repl_history.len(), self.repl_history_cursor, direction)?;
+        self.repl_history_cursor = next;
+        Some(match next {
+            Some(index) => self.repl_history[index].clone(),
+            // Past the newest entry: back to the empty line.
+            None => String::new(),
+        })
     }
 
     pub fn repl_break(&mut self) {
@@ -1174,7 +1615,7 @@ impl Workspace {
     pub fn repl_soft_reset(&mut self) {
         if let Some(connection) = &self.repl_connection {
             connection.send(&[repl::controls::SOFT_RESET]);
-            self.repl_output.push_str("\n[Soft Reset]\n");
+            self.repl_output.push_str("\n[Soft reset]\n");
         }
     }
 
@@ -1185,8 +1626,8 @@ impl Workspace {
     /// Forward any REPL bytes that arrived since the last frame into the
     /// terminal buffer. Called from render.
     pub fn drain_repl_events(&mut self) {
-        while let Some(rx) = &self.repl_events {
-            match rx.try_recv() {
+        while let Some(receiver) = &self.repl_events {
+            match receiver.try_recv() {
                 Ok(ReplEvent::Data(text)) => self.repl_output.push_str(&text),
                 Ok(ReplEvent::Disconnected) => {
                     self.repl_connection = None;
@@ -1195,20 +1636,22 @@ impl Workspace {
                     self.repl_output.push_str("\n--- Disconnected ---\n");
                     break;
                 }
-                Ok(ReplEvent::Error(err)) => {
-                    self.repl_output.push_str(&format!("\n[ERROR] {err}\n"));
+                Ok(ReplEvent::Error(error)) => {
+                    self.repl_output.push_str(&format!("\n[ERROR] {error}\n"));
                 }
                 Err(_) => break,
             }
         }
-    }
-
-    // -- Bottom panel --------------------------------------------------------
-
-    pub fn set_bottom_mode(&mut self, mode: BottomMode) {
-        self.bottom_mode = mode;
-        self.settings.bottom_mode = mode;
-        self.settings.save();
+        // The REPL view scrolls its own text; keep the buffer bounded so a
+        // chatty board cannot grow it without limit.
+        const MAX_REPL_BYTES: usize = 256 * 1024;
+        if self.repl_output.len() > MAX_REPL_BYTES {
+            let mut start = self.repl_output.len() - MAX_REPL_BYTES;
+            while !self.repl_output.is_char_boundary(start) {
+                start += 1;
+            }
+            self.repl_output.drain(..start);
+        }
     }
 
     // -- Recent projects -----------------------------------------------------
@@ -1222,42 +1665,98 @@ impl Workspace {
         self.settings.save();
     }
 
-    /// Detect profiles for a port, for the runtime-profile picker items.
-    pub fn profile_items(&self) -> Vec<ExecutionProfile> {
-        self.available_profiles.clone()
-    }
-
-    pub fn board_candidates(&self) -> Vec<&'static str> {
-        let port = self.selected_port_identity();
-        let overrides = &self.settings.board_overrides;
-        boards::identify_board(port.as_ref(), overrides).candidates
-    }
-
-    pub fn resolved_board(&self) -> boards::BoardMatch {
-        let port = self.selected_port_identity();
-        boards::identify_board(port.as_ref(), &self.settings.board_overrides)
-    }
-
-    /// Profile detection input for the currently-selected port, exposed for
-    /// tests and the welcome screen.
-    pub fn detected_board_label(&self) -> Option<String> {
-        self.resolved_board()
-            .board
-            .map(|b| b.name.to_string())
-            .or_else(|| {
-                (self.detected_board != BoardType::Unknown)
-                    .then(|| self.detected_board.label().to_string())
-            })
-    }
-
-    pub fn confidence_label(&self) -> Option<(String, String)> {
-        let profile = self.active_profile.as_ref()?;
-        Some((profile.runtime.label().to_string(), profile.variant.clone()))
-    }
-
     pub fn is_profile_pinned(&self, profile: &ExecutionProfile) -> bool {
         profile.confidence == Confidence::High && !profile.is_generic
     }
+}
+
+// ---------------------------------------------------------------------------
+// Free functions
+// ---------------------------------------------------------------------------
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Where the history cursor lands after one key press.
+///
+/// The outer `Option` says whether the cursor moved at all; the inner one is
+/// the new position, where `None` means the line being typed.
+fn step_history(
+    len: usize,
+    cursor: Option<usize>,
+    direction: HistoryStep,
+) -> Option<Option<usize>> {
+    if len == 0 {
+        return None;
+    }
+    let last = len - 1;
+    Some(match (cursor, direction) {
+        (None, HistoryStep::Older) => Some(last),
+        // Down from the line being typed has nowhere to go.
+        (None, HistoryStep::Newer) => return None,
+        // Up at the oldest entry stays there rather than clearing the input.
+        (Some(0), HistoryStep::Older) => return None,
+        (Some(index), HistoryStep::Older) => Some(index - 1),
+        (Some(index), HistoryStep::Newer) if index >= last => None,
+        (Some(index), HistoryStep::Newer) => Some(index + 1),
+    })
+}
+
+/// Tool output rarely marks its own severity, so recognise the shapes that
+/// always mean a failure. Anything less certain stays ordinary output.
+fn looks_like_an_error(message: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "error:",
+        "fatal error",
+        "Traceback (most recent call last)",
+        "command not found",
+        "Permission denied",
+    ];
+    MARKERS.iter().any(|marker| message.contains(marker))
+}
+
+/// The file to open first: the entry point for the project's kind, else the
+/// first source file, else the first file at all.
+fn pick_entry_file(files: &[ProjectFile], kind: ProjectKind) -> Option<ProjectFile> {
+    let preferred: &[&str] = match kind {
+        ProjectKind::CircuitPython => &["code.py", "main.py"],
+        ProjectKind::MicroPython => &["main.py", "boot.py"],
+        ProjectKind::EspIdf => &["main/main.c", "main/main.cpp"],
+        ProjectKind::PlatformIo => &["src/main.cpp", "src/main.c", "src/main.ino"],
+        ProjectKind::ArduinoSketch | ProjectKind::Unknown => &[],
+    };
+    for name in preferred {
+        if let Some(file) = files.iter().find(|file| file.relative == *name) {
+            return Some(file.clone());
+        }
+    }
+    files
+        .iter()
+        .find(|file| {
+            matches!(
+                file.language,
+                Language::Python | Language::Arduino | Language::C | Language::Cpp
+            )
+        })
+        .or_else(|| files.first())
+        .cloned()
+}
+
+/// `base/name`, or `base/name-2` when that is taken, so creating the same
+/// template twice does not overwrite the first project.
+fn unique_directory(base: &std::path::Path, name: &str) -> PathBuf {
+    let first = base.join(name);
+    if !first.exists() {
+        return first;
+    }
+    (2..100)
+        .map(|suffix| base.join(format!("{name}-{suffix}")))
+        .find(|candidate| !candidate.exists())
+        .unwrap_or(first)
 }
 
 /// List serial ports as `PortIdentity`s. Runs on the calling thread; the
@@ -1283,4 +1782,97 @@ fn list_serial_ports() -> Result<Vec<PortIdentity>, String> {
             })
             .collect(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(relative: &str, language: Language) -> ProjectFile {
+        ProjectFile {
+            name: relative.rsplit('/').next().unwrap().to_string(),
+            relative: relative.to_string(),
+            path: PathBuf::from(relative),
+            content: String::new(),
+            language,
+        }
+    }
+
+    #[test]
+    fn opens_the_entry_point_for_the_project_kind() {
+        let files = vec![
+            file("README.md", Language::Markdown),
+            file("platformio.ini", Language::Ini),
+            file("src/main.cpp", Language::Cpp),
+        ];
+        assert_eq!(
+            pick_entry_file(&files, ProjectKind::PlatformIo)
+                .unwrap()
+                .relative,
+            "src/main.cpp"
+        );
+
+        let micropython = vec![
+            file("helpers.py", Language::Python),
+            file("main.py", Language::Python),
+        ];
+        assert_eq!(
+            pick_entry_file(&micropython, ProjectKind::MicroPython)
+                .unwrap()
+                .relative,
+            "main.py"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_source_over_configuration() {
+        let files = vec![
+            file("platformio.ini", Language::Ini),
+            file("sketch.ino", Language::Arduino),
+        ];
+        assert_eq!(
+            pick_entry_file(&files, ProjectKind::Unknown)
+                .unwrap()
+                .relative,
+            "sketch.ino"
+        );
+        assert!(pick_entry_file(&[], ProjectKind::Unknown).is_none());
+    }
+
+    #[test]
+    fn error_shaped_output_is_logged_as_an_error() {
+        assert!(looks_like_an_error("main.cpp:4:1: error: expected ';'"));
+        assert!(looks_like_an_error("Traceback (most recent call last):"));
+        assert!(!looks_like_an_error("Writing at 0x00010000... (54 %)"));
+        assert!(!looks_like_an_error(
+            "Compiling .pio/build/esp32dev/src/main.cpp.o"
+        ));
+    }
+
+    #[test]
+    fn history_walks_back_then_returns_to_the_typed_line() {
+        use HistoryStep::{Newer, Older};
+        // Three entries, oldest first.
+        assert_eq!(step_history(3, None, Older), Some(Some(2)));
+        assert_eq!(step_history(3, Some(2), Older), Some(Some(1)));
+        assert_eq!(step_history(3, Some(0), Older), None, "stops at the oldest");
+        assert_eq!(step_history(3, Some(1), Newer), Some(Some(2)));
+        assert_eq!(
+            step_history(3, Some(2), Newer),
+            Some(None),
+            "past the newest is the line being typed"
+        );
+        assert_eq!(step_history(3, None, Newer), None);
+        assert_eq!(step_history(0, None, Older), None, "no history, no move");
+    }
+
+    #[test]
+    fn a_second_project_from_one_template_gets_its_own_folder() {
+        let base = tempfile::tempdir().unwrap();
+        let first = unique_directory(base.path(), "arduino-blink");
+        std::fs::create_dir_all(&first).unwrap();
+        let second = unique_directory(base.path(), "arduino-blink");
+        assert_ne!(first, second);
+        assert!(second.ends_with("arduino-blink-2"));
+    }
 }

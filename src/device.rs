@@ -1,12 +1,13 @@
-//! Device operations: run / upload code, flash firmware, deploy to
-//! CircuitPython, and drive `mpremote` for the device file tree.
+//! Device operations: run and upload code, flash firmware, deploy to
+//! CircuitPython, build native projects, and drive `mpremote` for the device
+//! file tree.
 //!
-//! Translated from the Electron `upload-code`, `run-code`, `stop-code`,
-//! `flash-firmware`, `circuitpython-deploy`, and `device-fs-*` IPC handlers.
-//! Progress lines flow to the shell log through `DeviceEvent`.
+//! Every function here blocks and spawns processes, so all of it runs on a
+//! background thread. Progress reaches the UI as [`DeviceEvent`] lines.
 
-use crate::boards::BoardType;
+use crate::boards::{BoardDef, Chip, FlashMethod, Runtime};
 use crate::profiles::CircuitPythonDrive;
+use crate::toolchain::{self, Tool};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,11 +15,18 @@ use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub enum DeviceEvent {
-    /// A progress line for the shell log (already cleaned of ANSI codes).
+    /// A progress line for the device log (already cleaned of ANSI codes).
     Progress(String),
 }
 
-/// Strip ANSI escape sequences so they don't pollute the shell log.
+/// Emit a progress line without the `DeviceEvent::Progress(...)` ceremony.
+macro_rules! progress {
+    ($emit:expr, $($arg:tt)*) => {
+        $emit(DeviceEvent::Progress(format!($($arg)*)))
+    };
+}
+
+/// Strip ANSI escape sequences so they don't pollute the log.
 pub fn strip_ansi(text: &str) -> String {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"\x1b\[\d+(;\d+)*[a-zA-Z]").unwrap())
@@ -26,11 +34,48 @@ pub fn strip_ansi(text: &str) -> String {
         .to_string()
 }
 
+/// What a streamed command left behind: how it exited, and the tail of its
+/// output for an error message.
+pub struct CommandOutcome {
+    pub status: std::process::ExitStatus,
+    pub tail: String,
+}
+
+impl CommandOutcome {
+    fn into_result(self, failure: &str) -> Result<(), String> {
+        if self.status.success() {
+            Ok(())
+        } else {
+            let tail = self.tail.trim();
+            Err(if tail.is_empty() {
+                failure.to_string()
+            } else {
+                format!("{failure}\n{tail}")
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mpremote
+// ---------------------------------------------------------------------------
+
 /// Result of an mpremote invocation with cleaned-up stderr.
 struct MpremoteResult {
     success: bool,
     stdout: String,
     stderr: String,
+}
+
+impl MpremoteResult {
+    /// The message worth showing, preferring the cleaned stderr.
+    fn error(self) -> String {
+        if self.stderr.is_empty() {
+            self.stdout
+        } else {
+            self.stderr
+        }
+    }
 }
 
 /// Clean tracebacks out of mpremote stderr — keep only the meaningful error.
@@ -53,35 +98,41 @@ fn clean_mpremote_stderr(stderr: &str) -> String {
     let lines: Vec<&str> = stderr
         .trim()
         .lines()
-        .filter(|l| {
-            let t = l.trim();
-            !t.is_empty()
-                && !t.starts_with("File \"")
-                && !t.starts_with("~~~")
-                && !t.starts_with('^')
-                && !t.contains("runpy")
-                && !t.contains("mpremote/")
-                && !t.contains("site-packages")
-                && !t.contains("Traceback")
-                && !t.contains("During handling")
+        .filter(|line| {
+            let text = line.trim();
+            !text.is_empty()
+                && !text.starts_with("File \"")
+                && !text.starts_with("~~~")
+                && !text.starts_with('^')
+                && !text.contains("runpy")
+                && !text.contains("mpremote/")
+                && !text.contains("site-packages")
+                && !text.contains("Traceback")
+                && !text.contains("During handling")
         })
         .collect();
     lines
         .last()
-        .map(|l| l.to_string())
+        .map(|line| line.to_string())
         .unwrap_or_else(|| stderr.trim().lines().next_back().unwrap_or("").to_string())
 }
 
-fn python_command() -> Command {
-    let mut cmd = Command::new("python3");
-    cmd.stdin(Stdio::null());
-    cmd
+fn missing_tool(tool: Tool) -> String {
+    format!("{} is not installed. {}", tool.name(), tool.install_hint())
 }
 
 fn run_mpremote(port_path: &str, sub_args: &[&str]) -> MpremoteResult {
-    let output = python_command()
-        .args(["-m", "mpremote", "connect", port_path])
+    let Some(mut command) = toolchain::command_for(Tool::Mpremote) else {
+        return MpremoteResult {
+            success: false,
+            stdout: String::new(),
+            stderr: missing_tool(Tool::Mpremote),
+        };
+    };
+    let output = command
+        .args(["connect", port_path])
         .args(sub_args)
+        .stdin(Stdio::null())
         .output();
 
     match output {
@@ -90,10 +141,10 @@ fn run_mpremote(port_path: &str, sub_args: &[&str]) -> MpremoteResult {
             stdout: String::from_utf8_lossy(&out.stdout).to_string(),
             stderr: clean_mpremote_stderr(&String::from_utf8_lossy(&out.stderr)),
         },
-        Err(e) => MpremoteResult {
+        Err(error) => MpremoteResult {
             success: false,
             stdout: String::new(),
-            stderr: e.to_string(),
+            stderr: error.to_string(),
         },
     }
 }
@@ -102,36 +153,37 @@ fn run_mpremote(port_path: &str, sub_args: &[&str]) -> MpremoteResult {
 // CircuitPython: deploy via the mounted CIRCUITPY drive
 // ---------------------------------------------------------------------------
 
-/// Candidate CIRCUITPY mount roots per OS. macOS mounts volumes flat under
-/// /Volumes; Linux distros use /media/<user>/<label> or /run/media/<user>.
-fn circuitpy_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
+/// Roots under which removable volumes mount, per OS. macOS mounts them flat
+/// under /Volumes; Linux distros use /media/<user> or /run/media/<user>.
+fn volume_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
     match std::env::consts::OS {
-        "macos" => candidates.push(PathBuf::from("/Volumes/CIRCUITPY")),
+        "macos" => roots.push(PathBuf::from("/Volumes")),
         "linux" => {
             for root in ["/media", "/run/media"] {
                 let root = Path::new(root);
                 if !root.exists() {
                     continue;
                 }
+                // Both /media/<label> and /media/<user>/<label> are in use.
+                roots.push(root.to_path_buf());
                 if let Ok(users) = std::fs::read_dir(root) {
-                    for user in users.flatten() {
-                        candidates.push(user.path().join("CIRCUITPY"));
-                    }
+                    roots.extend(users.flatten().map(|user| user.path()));
                 }
             }
         }
-        // Windows: enumerating drive letters by volume label needs extra
-        // tooling; detection still works via the Adafruit 239a VID there.
+        // Windows mounts volumes as drive letters; enumerating them by label
+        // needs platform APIs this build does not link.
         _ => {}
     }
-    candidates
+    roots
 }
 
-/// Detect a connected CircuitPython board by its hallmark: a mounted USB drive
-/// named CIRCUITPY containing boot_out.txt (board name + CP version).
+/// Detect a connected CircuitPython board by its hallmark: a mounted USB
+/// drive named CIRCUITPY containing boot_out.txt (board name + CP version).
 pub fn detect_circuitpython() -> CircuitPythonDrive {
-    for mount in circuitpy_candidates() {
+    for root in volume_roots() {
+        let mount = root.join("CIRCUITPY");
         let boot_out = mount.join("boot_out.txt");
         if !boot_out.exists() {
             continue;
@@ -193,15 +245,15 @@ pub fn circuitpython_deploy(
     // Disallow path traversal — write only to the drive root.
     let safe_name = Path::new(file_name)
         .file_name()
-        .and_then(|n| n.to_str())
+        .and_then(|name| name.to_str())
         .ok_or_else(|| "invalid file name".to_string())?;
     let dest = mount.join(safe_name);
-    std::fs::write(&dest, code).map_err(|e| e.to_string())?;
+    std::fs::write(&dest, code).map_err(|error| error.to_string())?;
     Ok(dest.to_string_lossy().to_string())
 }
 
 // ---------------------------------------------------------------------------
-// Run / upload via mpremote, with REPL-paste fallbacks
+// Run / upload via mpremote
 // ---------------------------------------------------------------------------
 
 /// Run Python code on the board via `mpremote run`, streaming progress.
@@ -211,46 +263,40 @@ pub fn run_code(
     emit: &mut dyn FnMut(DeviceEvent),
 ) -> Result<(), String> {
     let tmp = temporary_transfer_file(".py")?;
-    std::fs::write(&tmp, code).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, code).map_err(|error| error.to_string())?;
 
-    emit(DeviceEvent::Progress("Running code on device...".into()));
+    progress!(emit, "Running code on device…");
     let result = run_mpremote(port_path, &["run", tmp.to_string_lossy().as_ref()]);
 
     if result.success {
         for line in result.stdout.lines() {
-            emit(DeviceEvent::Progress(line.to_string()));
+            progress!(emit, "{line}");
         }
-        emit(DeviceEvent::Progress("[OK] Code execution finished".into()));
+        progress!(emit, "[OK] Code execution finished");
         Ok(())
     } else {
-        let err = if result.stderr.is_empty() {
-            result.stdout
-        } else {
-            result.stderr
-        };
-        Err(if err.is_empty() {
+        let error = result.error();
+        Err(if error.is_empty() {
             "Run failed".into()
         } else {
-            err
+            error
         })
     }
 }
 
-/// Soft-reset the board (the `stop` button).
+/// Soft-reset the board (the Stop button).
 pub fn stop_code(port_path: &str, emit: &mut dyn FnMut(DeviceEvent)) -> Result<(), String> {
-    emit(DeviceEvent::Progress(
-        "Sending soft reset (Ctrl+C) to device...".into(),
-    ));
+    progress!(emit, "Sending soft reset to device…");
     let result = run_mpremote(port_path, &["soft-reset"]);
     if result.success {
-        emit(DeviceEvent::Progress("[OK] Device reset".into()));
+        progress!(emit, "[OK] Device reset");
         Ok(())
     } else {
-        Err(result.stderr)
+        Err(result.error())
     }
 }
 
-/// Upload one file to the board via `mpremote cp` (with an ampy fallback).
+/// Upload one file to the board via `mpremote cp`.
 pub fn upload_code(
     port_path: &str,
     file_name: &str,
@@ -258,11 +304,9 @@ pub fn upload_code(
     emit: &mut dyn FnMut(DeviceEvent),
 ) -> Result<(), String> {
     let tmp = temporary_transfer_file(".py")?;
-    std::fs::write(&tmp, code).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, code).map_err(|error| error.to_string())?;
 
-    emit(DeviceEvent::Progress(format!(
-        "Uploading {file_name} via mpremote to {port_path}..."
-    )));
+    progress!(emit, "Uploading {file_name} to {port_path}…");
     let result = run_mpremote(
         port_path,
         &[
@@ -274,42 +318,15 @@ pub fn upload_code(
     );
 
     if result.success {
-        emit(DeviceEvent::Progress(format!("[OK] Uploaded {file_name}")));
+        progress!(emit, "[OK] Uploaded {file_name}");
         return Ok(());
     }
-
-    emit(DeviceEvent::Progress(
-        "[WARN] mpremote failed, trying ampy...".into(),
-    ));
-    let output = python_command()
-        .args([
-            "-m",
-            "ampy",
-            "--port",
-            port_path,
-            "put",
-            tmp.to_string_lossy().as_ref(),
-            &format!("/{file_name}"),
-        ])
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            emit(DeviceEvent::Progress(format!("[OK] Uploaded {file_name}")));
-            Ok(())
-        }
-        Ok(out) => {
-            let err = clean_mpremote_stderr(&String::from_utf8_lossy(&out.stderr));
-            Err(if err.is_empty() {
-                "ampy failed".into()
-            } else {
-                err
-            })
-        }
-        Err(_) => Err(
-            "No upload tool available. Install mpremote: python3 -m pip install mpremote".into(),
-        ),
-    }
+    let error = result.error();
+    Err(if error.is_empty() {
+        format!("Could not upload {file_name}")
+    } else {
+        error
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -322,233 +339,166 @@ pub struct FlashOutcome {
     pub hint: Option<String>,
 }
 
-fn flash_outcome(success: bool, error: Option<String>, hint: Option<String>) -> FlashOutcome {
-    FlashOutcome {
-        success,
-        error,
-        hint,
-    }
-}
-
-/// Detect the Espressif chip type from `esptool flash_id` output.
-pub fn chip_type_from_flash_id(text: &str) -> &'static str {
-    // The flash ID line looks like "Detecting chip type... ESP32-S3 (revision ...)".
-    for (needle, chip) in [
-        ("ESP32-S3", "ESP32_GENERIC_S3"),
-        ("ESP32-C3", "ESP32_GENERIC_C3"),
-        ("ESP32-C6", "ESP32_GENERIC_C6"),
-        ("ESP32-S2", "ESP32_GENERIC_S2"),
-        ("ESP8266", "ESP8266_GENERIC"),
-    ] {
-        if text.contains(needle) {
-            return chip;
+impl FlashOutcome {
+    fn ok() -> Self {
+        Self {
+            success: true,
+            error: None,
+            hint: None,
         }
     }
-    "ESP32_GENERIC"
-}
 
-/// The flash offset per chip family.
-pub fn flash_offset(chip: &str) -> &'static str {
-    if chip.starts_with("ESP32_GENERIC_S3") || chip == "ESP32_GENERIC_S2" {
-        "0x0"
-    } else {
-        "0x1000"
+    fn failed(error: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            error: Some(error.into()),
+            hint: None,
+        }
+    }
+
+    fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    /// The single message to show for a failure.
+    pub fn message(self) -> String {
+        let error = self.error.unwrap_or_else(|| "Flashing failed".into());
+        match self.hint {
+            Some(hint) => format!("{error}\n{hint}"),
+            None => error,
+        }
     }
 }
 
-/// Download the latest MicroPython firmware .bin/.uf2 for a board and flash it
-/// with esptool (or copy a .uf2 to the RPI-RP2 volume for RP2040).
-///
-/// A simplified but faithful port of the Electron `flash-firmware` handler's
-/// auto-download path. Progress streams through `emit`.
+/// Where the firmware image comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirmwareSource {
+    /// The latest MicroPython build for the board's variant.
+    MicroPython,
+    /// The latest CircuitPython build for the board's slug.
+    CircuitPython,
+    /// An image the user picked from disk.
+    LocalFile(PathBuf),
+}
+
+impl FirmwareSource {
+    pub fn label(&self) -> String {
+        match self {
+            FirmwareSource::MicroPython => "MicroPython".into(),
+            FirmwareSource::CircuitPython => "CircuitPython".into(),
+            FirmwareSource::LocalFile(path) => path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Local file".into()),
+        }
+    }
+}
+
+/// Download (or take) a firmware image and write it to the board.
 pub fn flash_firmware(
     port_path: &str,
-    board_type: BoardType,
-    firmware_variant: Option<&str>,
+    board: &BoardDef,
+    source: FirmwareSource,
     emit: &mut dyn FnMut(DeviceEvent),
 ) -> FlashOutcome {
-    emit(DeviceEvent::Progress(format!(
-        "Starting {} firmware flash on {port_path}...",
-        board_type.label()
-    )));
+    progress!(
+        emit,
+        "Flashing {} on {} · {}",
+        board.name,
+        port_path,
+        source.label()
+    );
 
-    match board_type {
-        BoardType::RaspberryPi => flash_rp2040(port_path, emit),
-        BoardType::Espressif | BoardType::M5StackAtom | BoardType::M5StampS3 => {
-            flash_espressif(port_path, board_type, firmware_variant, emit)
+    if board.flash == FlashMethod::Unsupported {
+        return FlashOutcome::failed(format!(
+            "{} has no firmware-flashing path in Anode.",
+            board.name
+        ))
+        .with_hint("Compile and upload a sketch or a native project instead.");
+    }
+
+    // A temp path has to outlive the write, so keep the guard in scope.
+    let downloaded;
+    let firmware: &Path = match &source {
+        FirmwareSource::LocalFile(path) => {
+            if !path.is_file() {
+                return FlashOutcome::failed(format!("{} no longer exists.", path.display()));
+            }
+            path
         }
-        BoardType::Arduino => flash_outcome(
-            false,
-            Some("Arduino flashing requires a compiled firmware file".into()),
-            Some("Install arduino-cli: https://arduino.github.io/arduino-cli/".into()),
-        ),
-        BoardType::Unknown => flash_outcome(false, Some("Unknown board type".into()), None),
-    }
-}
-
-fn download_file(url: &str, dest: &Path) -> Result<(), String> {
-    let bytes = ureq_redirecting_get(url)?;
-    std::fs::write(dest, bytes).map_err(|e| e.to_string())
-}
-
-/// Minimal HTTP(S) GET following redirects. Avoids pulling a full HTTP client
-/// into the dependency tree; firmware downloads are the only network use.
-fn ureq_redirecting_get(url: &str) -> Result<Vec<u8>, String> {
-    // curl is present on macOS and nearly all Linux images; Windows 10+ ships
-    // it too. Shelling out keeps the binary lean for this one operation.
-    let output = Command::new("curl")
-        .args(["-fsSL", "--connect-timeout", "15", "--max-time", "180", url])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        return Err(format!(
-            "download failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(output.stdout)
-}
-
-/// Find the firmware link on a micropython.org download page.
-fn get_micropython_url(page_url: &str, prefer_ext: &str) -> Result<String, String> {
-    let bytes = ureq_redirecting_get(page_url)?;
-    let body = String::from_utf8_lossy(&bytes).to_string();
-    let mut links: Vec<String> = Vec::new();
-    let mut rest: &str = &body;
-    while let Some(start) = rest.find("/resources/firmware/") {
-        let after = &rest[start..];
-        let end = after.find('"').unwrap_or(after.len());
-        links.push(after[..end].to_string());
-        rest = &after[end..];
-    }
-    let pick = links
-        .iter()
-        .find(|l| l.ends_with(prefer_ext) && !l.ends_with(".app-bin"))
-        .or_else(|| links.iter().find(|l| l.ends_with(prefer_ext)))
-        .or_else(|| links.first());
-    match pick {
-        Some(link) => Ok(format!("https://micropython.org{link}")),
-        None => Err(format!("Could not find firmware link on {page_url}")),
-    }
-}
-
-fn flash_rp2040(port_path: &str, emit: &mut dyn FnMut(DeviceEvent)) -> FlashOutcome {
-    let _ = port_path;
-    emit(DeviceEvent::Progress(
-        "Connect the intended Pico in BOOTSEL mode; looking for its RPI-RP2 boot volume…".into(),
-    ));
-    let firmware = match download_micropython("RPI_PICO", ".uf2", &mut |m| emit(m.clone())) {
-        Ok(path) => path,
-        Err(e) => return flash_outcome(false, Some(e), None),
+        FirmwareSource::MicroPython => {
+            let Some(variant) = board.mpy_variant else {
+                return FlashOutcome::failed(format!(
+                    "No MicroPython build is published for {}.",
+                    board.name
+                ))
+                .with_hint("Pick a different firmware source, or flash an image from disk.");
+            };
+            match download_micropython(variant, board.flash.firmware_extension(), emit) {
+                Ok(path) => {
+                    downloaded = path;
+                    downloaded.as_ref()
+                }
+                Err(error) => return FlashOutcome::failed(error),
+            }
+        }
+        FirmwareSource::CircuitPython => {
+            let Some(slug) = board.cpy_board else {
+                return FlashOutcome::failed(format!(
+                    "Anode does not know the CircuitPython board id for {}.",
+                    board.name
+                ))
+                .with_hint("Download the image from circuitpython.org, then flash it from disk.");
+            };
+            match download_circuitpython(slug, board.flash.firmware_extension(), emit) {
+                Ok(path) => {
+                    downloaded = path;
+                    downloaded.as_ref()
+                }
+                Err(error) => return FlashOutcome::failed(error),
+            }
+        }
     };
-    let mut dest = None;
-    for _ in 0..20 {
-        let mounts = rp2040_boot_volumes();
-        if mounts.len() > 1 {
-            return flash_outcome(false, Some("Multiple RPI-RP2 boot volumes found.".into()),
-                Some("Disconnect the other Pico boards and retry with only the intended board in BOOTSEL mode.".into()));
-        }
-        dest = mounts.into_iter().next();
-        if dest.is_some() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    let Some(dest) = dest else {
-        return flash_outcome(
-            false,
-            Some("RPI-RP2 boot volume not found".into()),
-            Some("Hold BOOTSEL while reconnecting the intended Pico over USB.".into()),
-        );
-    };
-    let filename = firmware.file_name().unwrap_or_default().to_string_lossy();
-    let target = dest.join(&*filename);
-    match std::fs::copy(&firmware, &target) {
-        Ok(_) => {
-            emit(DeviceEvent::Progress(format!(
-                "[OK] Copied {filename} to {}",
-                dest.display()
-            )));
-            emit(DeviceEvent::Progress(
-                "[OK] Raspberry Pi Pico firmware flashed successfully".into(),
-            ));
-            flash_outcome(true, None, None)
-        }
-        Err(e) => flash_outcome(false, Some(e.to_string()), None),
-    }
+
+    write_firmware(port_path, board, firmware, emit)
 }
 
-fn rp2040_boot_volumes() -> Vec<PathBuf> {
-    let mut roots = vec![PathBuf::from("/Volumes")];
-    for root in ["/media", "/run/media"] {
-        if let Ok(users) = std::fs::read_dir(root) {
-            roots.extend(users.flatten().map(|user| user.path()));
-        }
-    }
-    let mut mounts: Vec<_> = roots
-        .into_iter()
-        .filter_map(|root| std::fs::read_dir(root).ok())
-        .flatten()
-        .flatten()
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("RPI-RP2"))
-        .map(|entry| entry.path())
-        .filter(|path| path.join("INFO_UF2.TXT").exists())
-        .collect();
-    mounts.sort();
-    mounts.dedup();
-    mounts
-}
-
-fn temporary_transfer_file(ext: &str) -> Result<tempfile::TempPath, String> {
-    tempfile::Builder::new()
-        .prefix("anode-transfer-")
-        .suffix(ext)
-        .tempfile()
-        .map(|file| file.into_temp_path())
-        .map_err(|error| error.to_string())
-}
-
-fn download_micropython(
-    chip: &str,
-    ext: &str,
-    emit: &mut dyn FnMut(&DeviceEvent),
-) -> Result<tempfile::TempPath, String> {
-    emit(&DeviceEvent::Progress(format!(
-        "Auto-detecting and downloading latest firmware for {chip}..."
-    )));
-    let url = get_micropython_url(&format!("https://micropython.org/download/{chip}/"), ext)?;
-    emit(&DeviceEvent::Progress(format!("Downloading {url}...")));
-    let dest = temporary_transfer_file(ext)?;
-    download_file(&url, &dest)?;
-    emit(&DeviceEvent::Progress(format!(
-        "Downloaded to {}",
-        dest.display()
-    )));
-    Ok(dest)
-}
-
-fn flash_espressif(
+/// Write an image that is already on disk, using the board's flash method.
+fn write_firmware(
     port_path: &str,
-    board_type: BoardType,
-    firmware_variant: Option<&str>,
+    board: &BoardDef,
+    firmware: &Path,
     emit: &mut dyn FnMut(DeviceEvent),
 ) -> FlashOutcome {
-    let chip = firmware_variant
-        .or_else(|| board_type.micro_python_chip())
-        .unwrap_or("ESP32_GENERIC");
-    let firmware = match download_micropython(chip, ".bin", &mut |m| emit(m.clone())) {
-        Ok(path) => path,
-        Err(e) => return flash_outcome(false, Some(e), None),
-    };
+    match board.flash {
+        FlashMethod::Esptool => write_with_esptool(port_path, board.chip, firmware, emit),
+        FlashMethod::MassStorage { volume, marker } => {
+            copy_to_boot_volume(volume, marker, firmware, emit)
+        }
+        FlashMethod::DfuUtil => write_with_dfu_util(firmware, emit),
+        FlashMethod::Bossac => write_with_bossac(port_path, firmware, emit),
+        FlashMethod::TeensyLoader => write_with_teensy_loader(board.chip, firmware, emit),
+        FlashMethod::Unsupported => FlashOutcome::failed("This board cannot be flashed directly."),
+    }
+}
 
-    emit(DeviceEvent::Progress(
-        "Running esptool via python3...".into(),
-    ));
-    let mut command = Command::new("python3");
+fn write_with_esptool(
+    port_path: &str,
+    chip: Chip,
+    firmware: &Path,
+    emit: &mut dyn FnMut(DeviceEvent),
+) -> FlashOutcome {
+    let Some(mut command) = toolchain::command_for(Tool::Esptool) else {
+        return FlashOutcome::failed(missing_tool(Tool::Esptool));
+    };
+    let offset = chip.flash_offset();
+    progress!(
+        emit,
+        "Writing {} at {offset} with esptool…",
+        firmware.display()
+    );
     command.args([
-        "-u",
-        "-m",
-        "esptool",
         "--port",
         port_path,
         "--baud",
@@ -559,44 +509,316 @@ fn flash_espressif(
         "hard_reset",
         "write_flash",
         "-z",
-        flash_offset(chip),
+        offset,
         firmware.to_string_lossy().as_ref(),
     ]);
-    let output = stream_command(&mut command, emit);
 
-    match output {
-        Ok((status, output)) => {
-            if status.success() {
-                emit(DeviceEvent::Progress(
-                    "[OK] Espressif firmware flashed successfully".into(),
-                ));
-                flash_outcome(true, None, None)
-            } else {
-                let err = output;
-                let is_connection_error = err.contains("No serial data received")
-                    || err.contains("Failed to connect")
-                    || err.contains("chip stopped responding");
-                flash_outcome(
-                    false,
-                    Some(err.trim().to_string()),
-                    Some(if is_connection_error {
-                        "Failed to connect. Try holding the BOOT button on your board while it connects."
-                            .into()
-                    } else {
-                        "Install esptool: pip install esptool".into()
-                    }),
-                )
-            }
+    match run_streaming(&mut command, emit) {
+        Ok(outcome) if outcome.status.success() => {
+            progress!(emit, "[OK] Firmware written");
+            FlashOutcome::ok()
         }
-        Err(e) => flash_outcome(
-            false,
-            Some(e.to_string()),
-            Some("Install esptool: pip install esptool".into()),
-        ),
+        Ok(outcome) => {
+            let connection_failed = outcome.tail.contains("No serial data received")
+                || outcome.tail.contains("Failed to connect")
+                || outcome.tail.contains("chip stopped responding");
+            FlashOutcome::failed(outcome.tail.trim().to_string()).with_hint(if connection_failed {
+                "Hold the BOOT button while the board connects, then try again."
+            } else {
+                "Check that no REPL or serial monitor is holding the port."
+            })
+        }
+        Err(error) => FlashOutcome::failed(error),
     }
 }
 
-/// Drain both pipes concurrently. Esptool uses carriage returns for progress;
+/// Copy an image onto a bootloader volume the board mounts as a disk.
+fn copy_to_boot_volume(
+    volume: Option<&'static str>,
+    marker: &'static str,
+    firmware: &Path,
+    emit: &mut dyn FnMut(DeviceEvent),
+) -> FlashOutcome {
+    let wanted = volume.unwrap_or("bootloader");
+    progress!(emit, "Looking for the {wanted} volume…");
+
+    // The board reboots into its bootloader as the user watches, so give the
+    // volume a few seconds to appear rather than failing on the first look.
+    let mut found = Vec::new();
+    for _ in 0..20 {
+        found = boot_volumes(volume, marker);
+        if !found.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    match found.len() {
+        0 => FlashOutcome::failed(format!("No {wanted} volume is mounted.")).with_hint(
+            FlashMethod::MassStorage { volume, marker }
+                .preparation()
+                .unwrap_or("Put the board into its bootloader and try again."),
+        ),
+        1 => {
+            let dest = &found[0];
+            let name = firmware.file_name().unwrap_or_default().to_string_lossy();
+            match std::fs::copy(firmware, dest.join(&*name)) {
+                Ok(_) => {
+                    progress!(emit, "[OK] Copied {name} to {}", dest.display());
+                    progress!(
+                        emit,
+                        "[OK] The board restarts on its own once the copy lands"
+                    );
+                    FlashOutcome::ok()
+                }
+                Err(error) => FlashOutcome::failed(error.to_string()),
+            }
+        }
+        count => FlashOutcome::failed(format!("{count} bootloader volumes are mounted."))
+            .with_hint("Disconnect the other boards, leaving only the one you are flashing."),
+    }
+}
+
+/// Mounted bootloader volumes: those carrying `marker`, optionally narrowed
+/// to a volume-name prefix.
+pub fn boot_volumes(volume: Option<&str>, marker: &str) -> Vec<PathBuf> {
+    let mut mounts: Vec<PathBuf> = volume_roots()
+        .into_iter()
+        .filter_map(|root| std::fs::read_dir(root).ok())
+        .flatten()
+        .flatten()
+        .filter(|entry| match volume {
+            Some(prefix) => entry.file_name().to_string_lossy().starts_with(prefix),
+            None => true,
+        })
+        .map(|entry| entry.path())
+        .filter(|path| path.join(marker).exists())
+        .collect();
+    mounts.sort();
+    mounts.dedup();
+    mounts
+}
+
+fn write_with_dfu_util(firmware: &Path, emit: &mut dyn FnMut(DeviceEvent)) -> FlashOutcome {
+    let Some(mut command) = toolchain::command_for(Tool::DfuUtil) else {
+        return FlashOutcome::failed(missing_tool(Tool::DfuUtil));
+    };
+    progress!(emit, "Writing {} with dfu-util…", firmware.display());
+    command.args([
+        "-a",
+        "0",
+        "-s",
+        "0x08000000:leave",
+        "-D",
+        firmware.to_string_lossy().as_ref(),
+    ]);
+    match run_streaming(&mut command, emit) {
+        Ok(outcome) if outcome.status.success() => {
+            progress!(emit, "[OK] Firmware written");
+            FlashOutcome::ok()
+        }
+        Ok(outcome) => FlashOutcome::failed(outcome.tail.trim().to_string())
+            .with_hint("Put the board in DFU mode (BOOT0 high, then reset) and try again."),
+        Err(error) => FlashOutcome::failed(error),
+    }
+}
+
+fn write_with_bossac(
+    port_path: &str,
+    firmware: &Path,
+    emit: &mut dyn FnMut(DeviceEvent),
+) -> FlashOutcome {
+    let Some(mut command) = toolchain::command_for(Tool::Bossac) else {
+        return FlashOutcome::failed(missing_tool(Tool::Bossac));
+    };
+    // bossac wants the device name, not the full path.
+    let device = port_path.rsplit('/').next().unwrap_or(port_path);
+    progress!(emit, "Writing {} with bossac…", firmware.display());
+    command.args([
+        "-i",
+        "-d",
+        &format!("--port={device}"),
+        "-U",
+        "-e",
+        "-w",
+        "-v",
+        firmware.to_string_lossy().as_ref(),
+        "-R",
+    ]);
+    match run_streaming(&mut command, emit) {
+        Ok(outcome) if outcome.status.success() => {
+            progress!(emit, "[OK] Firmware written");
+            FlashOutcome::ok()
+        }
+        Ok(outcome) => FlashOutcome::failed(outcome.tail.trim().to_string())
+            .with_hint("Double-tap RESET to start the bootloader, then try again."),
+        Err(error) => FlashOutcome::failed(error),
+    }
+}
+
+fn write_with_teensy_loader(
+    chip: Chip,
+    firmware: &Path,
+    emit: &mut dyn FnMut(DeviceEvent),
+) -> FlashOutcome {
+    let Some(mut command) = toolchain::command_for(Tool::TeensyLoader) else {
+        return FlashOutcome::failed(missing_tool(Tool::TeensyLoader));
+    };
+    let mcu = match chip {
+        Chip::Imxrt1062 => "TEENSY40",
+        _ => "TEENSY31",
+    };
+    progress!(
+        emit,
+        "Writing {} with teensy_loader_cli…",
+        firmware.display()
+    );
+    command.args([
+        &format!("--mcu={mcu}"),
+        "-w",
+        "-v",
+        firmware.to_string_lossy().as_ref(),
+    ]);
+    match run_streaming(&mut command, emit) {
+        Ok(outcome) if outcome.status.success() => {
+            progress!(emit, "[OK] Firmware written");
+            FlashOutcome::ok()
+        }
+        Ok(outcome) => FlashOutcome::failed(outcome.tail.trim().to_string())
+            .with_hint("Press the button on the Teensy to put it in programming mode."),
+        Err(error) => FlashOutcome::failed(error),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Firmware downloads
+// ---------------------------------------------------------------------------
+
+fn temporary_transfer_file(ext: &str) -> Result<tempfile::TempPath, String> {
+    tempfile::Builder::new()
+        .prefix("anode-transfer-")
+        .suffix(ext)
+        .tempfile()
+        .map(|file| file.into_temp_path())
+        .map_err(|error| error.to_string())
+}
+
+/// Minimal HTTP(S) GET following redirects. `curl` ships with macOS, nearly
+/// every Linux image and Windows 10+; shelling out to it keeps a full HTTP
+/// client out of the dependency tree for the one thing that needs the network.
+fn http_get(url: &str) -> Result<Vec<u8>, String> {
+    let curl = toolchain::locate_executable("curl")
+        .ok_or_else(|| "curl is not installed, so firmware cannot be downloaded".to_string())?;
+    let output = Command::new(curl)
+        .args(["-fsSL", "--connect-timeout", "15", "--max-time", "300", url])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "Could not download {url}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output.stdout)
+}
+
+/// Pull every `href`-like value out of a page. Firmware index pages are plain
+/// enough that splitting on quotes finds the links without a HTML parser.
+fn page_links(body: &str) -> Vec<&str> {
+    body.split(['"', '\''])
+        .filter(|candidate| candidate.contains("/firmware/") || candidate.contains("/bin/"))
+        .collect()
+}
+
+/// Find the firmware link on a micropython.org download page.
+fn micropython_url(variant: &str, extension: &str) -> Result<String, String> {
+    let page = format!("https://micropython.org/download/{variant}/");
+    let body = String::from_utf8_lossy(&http_get(&page)?).to_string();
+    let links: Vec<&str> = page_links(&body)
+        .into_iter()
+        .filter(|link| link.starts_with("/resources/firmware/"))
+        .collect();
+    // `.app-bin` is the OTA image, not the full flash image.
+    let pick = links
+        .iter()
+        .find(|link| link.ends_with(extension) && !link.ends_with(".app-bin"))
+        .or_else(|| links.first());
+    match pick {
+        Some(link) => Ok(format!("https://micropython.org{link}")),
+        None => Err(format!(
+            "micropython.org lists no {extension} build for {variant}. Pick another board model, \
+             or flash an image from disk."
+        )),
+    }
+}
+
+/// Find the firmware link on a circuitpython.org board page.
+fn circuitpython_url(slug: &str, extension: &str) -> Result<String, String> {
+    let page = format!("https://circuitpython.org/board/{slug}/");
+    let body = String::from_utf8_lossy(&http_get(&page)?).to_string();
+    let links: Vec<&str> = page_links(&body)
+        .into_iter()
+        .filter(|link| link.starts_with("https://downloads.circuitpython.org/bin/"))
+        .collect();
+    // Prefer the English build in the board's own image format.
+    let pick = links
+        .iter()
+        .find(|link| link.ends_with(extension) && link.contains("en_US"))
+        .or_else(|| links.iter().find(|link| link.ends_with(extension)));
+    match pick {
+        Some(link) => Ok((*link).to_string()),
+        None => Err(format!(
+            "circuitpython.org lists no {extension} build for {slug}. Download the image yourself, \
+             then flash it from disk."
+        )),
+    }
+}
+
+fn download(
+    url: &str,
+    extension: &str,
+    emit: &mut dyn FnMut(DeviceEvent),
+) -> Result<tempfile::TempPath, String> {
+    progress!(emit, "Downloading {url}");
+    let bytes = http_get(url)?;
+    let dest = temporary_transfer_file(extension)?;
+    std::fs::write(&dest, &bytes).map_err(|error| error.to_string())?;
+    progress!(emit, "Downloaded {} KB", bytes.len() / 1024);
+    Ok(dest)
+}
+
+fn download_micropython(
+    variant: &str,
+    extension: &str,
+    emit: &mut dyn FnMut(DeviceEvent),
+) -> Result<tempfile::TempPath, String> {
+    progress!(
+        emit,
+        "Looking up the latest MicroPython build for {variant}…"
+    );
+    let url = micropython_url(variant, extension)?;
+    download(&url, extension, emit)
+}
+
+fn download_circuitpython(
+    slug: &str,
+    extension: &str,
+    emit: &mut dyn FnMut(DeviceEvent),
+) -> Result<tempfile::TempPath, String> {
+    progress!(
+        emit,
+        "Looking up the latest CircuitPython build for {slug}…"
+    );
+    let url = circuitpython_url(slug, extension)?;
+    download(&url, extension, emit)
+}
+
+// ---------------------------------------------------------------------------
+// Process streaming
+// ---------------------------------------------------------------------------
+
+/// Drain both pipes concurrently. esptool uses carriage returns for progress;
 /// bounded chunks also keep unbroken output from accumulating indefinitely.
 fn forward_process_lines(
     reader: impl Read,
@@ -625,10 +847,12 @@ fn forward_process_lines(
     Ok(())
 }
 
-fn stream_command(
+/// Run a command, forwarding each output line to `emit` as it arrives, and
+/// keeping the tail for an error message.
+pub fn run_streaming(
     command: &mut Command,
     emit: &mut dyn FnMut(DeviceEvent),
-) -> Result<(std::process::ExitStatus, String), String> {
+) -> Result<CommandOutcome, String> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -637,22 +861,22 @@ fn stream_command(
         .map_err(|error| error.to_string())?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let mut output = String::new();
+    let mut tail = String::new();
     let read_result = std::thread::scope(|scope| {
         let (sender, receiver) = std::sync::mpsc::channel();
         let errors = sender.clone();
         let out = scope.spawn(move || forward_process_lines(stdout, sender));
         let err = scope.spawn(move || forward_process_lines(stderr, errors));
         for line in receiver {
-            output.push_str(&line);
-            output.push('\n');
-            // Preserve a useful tail for errors without retaining the entire process log.
-            if output.len() > 65536 {
-                let mut start = output.len() - 49152;
-                while !output.is_char_boundary(start) {
+            tail.push_str(&line);
+            tail.push('\n');
+            // Preserve a useful tail without retaining the entire process log.
+            if tail.len() > 65536 {
+                let mut start = tail.len() - 49152;
+                while !tail.is_char_boundary(start) {
                     start += 1;
                 }
-                output.drain(..start);
+                tail.drain(..start);
             }
             emit(DeviceEvent::Progress(line));
         }
@@ -664,141 +888,67 @@ fn stream_command(
     });
     let status = child.wait().map_err(|error| error.to_string())?;
     read_result?;
-    Ok((status, output))
+    Ok(CommandOutcome { status, tail })
 }
 
 // ---------------------------------------------------------------------------
-// Tool availability / installation
+// Arduino: compile and upload through arduino-cli
 // ---------------------------------------------------------------------------
 
-/// Check whether a flashing tool is available (in PATH or a common location).
-pub fn tool_available(tool: &str) -> bool {
-    if which_exists(tool) {
-        return true;
+/// Add a third-party package index to `arduino-cli`, so its core can be
+/// installed. Indexes already present are left alone.
+fn add_board_index(index_url: &str, emit: &mut dyn FnMut(DeviceEvent)) -> Result<(), String> {
+    let Some(mut command) = toolchain::command_for(Tool::ArduinoCli) else {
+        return Err(missing_tool(Tool::ArduinoCli));
+    };
+    progress!(emit, "Registering board index {index_url}");
+    command.args(["config", "add", "board_manager.additional_urls", index_url]);
+    // A duplicate entry is reported as an error; the outcome we want is the
+    // index being present either way, so only a failed update is fatal.
+    let _ = run_streaming(&mut command, emit);
+
+    let Some(mut update) = toolchain::command_for(Tool::ArduinoCli) else {
+        return Err(missing_tool(Tool::ArduinoCli));
+    };
+    update.args(["core", "update-index"]);
+    run_streaming(&mut update, emit)?.into_result("Could not refresh the board index")
+}
+
+/// Install the `arduino-cli` core a board's FQBN comes from.
+pub fn arduino_core_install(
+    board: &BoardDef,
+    emit: &mut dyn FnMut(DeviceEvent),
+) -> Result<(), String> {
+    let Some(core) = board.core else {
+        return Err(format!("{} has no Arduino core in Anode.", board.name));
+    };
+    if let Some(index_url) = core.index_url {
+        add_board_index(index_url, emit)?;
     }
-    match tool {
-        "esptool.py" | "esptool" => {
-            // pip-installed Python packages: probe the import.
-            Command::new("python3")
-                .args(["-c", "import esptool; print(esptool.__version__)"])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        }
-        "arduino-cli" => COMMON_TOOL_PATHS
-            .iter()
-            .any(|p| Path::new(&p.replace('~', &home_dir())).exists()),
-        _ => false,
-    }
+    let Some(mut command) = toolchain::command_for(Tool::ArduinoCli) else {
+        return Err(missing_tool(Tool::ArduinoCli));
+    };
+    progress!(emit, "Installing the {} core…", core.id);
+    command.args(["core", "install", core.id]);
+    run_streaming(&mut command, emit)?
+        .into_result(&format!("Could not install the {} core", core.id))?;
+    progress!(emit, "[OK] {} installed", core.id);
+    Ok(())
 }
-
-const COMMON_TOOL_PATHS: &[&str] = &[
-    "~/Library/Python/3.11/bin/esptool",
-    "~/Library/Python/3.12/bin/esptool",
-    "~/Library/Python/3.13/bin/esptool",
-    "~/.arduino-cli/bin/arduino-cli",
-    "~/.local/bin/arduino-cli",
-    "/opt/homebrew/bin/arduino-cli",
-    "/usr/local/bin/arduino-cli",
-];
-
-fn home_dir() -> String {
-    std::env::var("HOME").unwrap_or_default()
-}
-
-fn which_exists(tool: &str) -> bool {
-    Command::new(tool)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Install a missing flashing tool. Streams progress; returns (success, error).
-pub fn install_tool(tool: &str, emit: &mut dyn FnMut(DeviceEvent)) -> Result<(), String> {
-    match tool {
-        "esptool.py" | "esptool" => {
-            emit(DeviceEvent::Progress("Installing esptool...".into()));
-            let pip_cmds: &[&[&str]] = if cfg!(windows) {
-                &[
-                    &["pip", "install", "esptool"],
-                    &["python", "-m", "pip", "install", "esptool"],
-                ]
-            } else {
-                &[
-                    &["python3", "-m", "pip", "install", "--user", "esptool"],
-                    &[
-                        "python3",
-                        "-m",
-                        "pip",
-                        "install",
-                        "--user",
-                        "--break-system-packages",
-                        "esptool",
-                    ],
-                    &["pip3", "install", "--user", "esptool"],
-                ]
-            };
-            for cmd in pip_cmds {
-                emit(DeviceEvent::Progress(format!("Trying: {}", cmd.join(" "))));
-                if let Ok(output) = Command::new(cmd[0]).args(&cmd[1..]).output() {
-                    if output.status.success() {
-                        emit(DeviceEvent::Progress(
-                            "[OK] esptool installed successfully".into(),
-                        ));
-                        return Ok(());
-                    }
-                    for line in String::from_utf8_lossy(&output.stderr).lines() {
-                        emit(DeviceEvent::Progress(line.to_string()));
-                    }
-                }
-            }
-            Err(
-                "Could not find pip. Install Python 3 from python.org or via brew install python3"
-                    .into(),
-            )
-        }
-        "arduino-cli" => {
-            emit(DeviceEvent::Progress(
-                "arduino-cli auto-install is not yet available in this build".into(),
-            ));
-            Err("Install arduino-cli: https://arduino.github.io/arduino-cli/".into())
-        }
-        other => Err(format!("Unknown tool: {other}")),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Arduino compile / upload via arduino-cli
-// ---------------------------------------------------------------------------
 
 pub fn arduino_compile(
     sketch_path: &Path,
     fqbn: &str,
     emit: &mut dyn FnMut(DeviceEvent),
 ) -> Result<(), String> {
-    emit(DeviceEvent::Progress(format!(
-        "Compiling {} ({fqbn})...",
-        sketch_path.display()
-    )));
-    let output = Command::new("arduino-cli")
-        .args(["compile", "--fqbn", fqbn])
-        .arg(sketch_path)
-        .output()
-        .map_err(|e| format!("arduino-cli not found: {e}"))?;
-
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        emit(DeviceEvent::Progress(strip_ansi(line)));
-    }
-    if output.status.success() {
-        emit(DeviceEvent::Progress("[OK] Compile successful".into()));
-        Ok(())
-    } else {
-        let err = String::from_utf8_lossy(&output.stderr).to_string();
-        Err(strip_ansi(&err))
-    }
+    let Some(mut command) = toolchain::command_for(Tool::ArduinoCli) else {
+        return Err(missing_tool(Tool::ArduinoCli));
+    };
+    progress!(emit, "Compiling {} for {fqbn}…", sketch_path.display());
+    command.args(["compile", "--fqbn", fqbn]).arg(sketch_path);
+    run_streaming(&mut command, emit)?.into_result("Compile failed")?;
+    progress!(emit, "[OK] Compile finished");
+    Ok(())
 }
 
 pub fn arduino_upload(
@@ -807,25 +957,127 @@ pub fn arduino_upload(
     fqbn: &str,
     emit: &mut dyn FnMut(DeviceEvent),
 ) -> Result<(), String> {
-    emit(DeviceEvent::Progress(format!(
-        "Uploading to {port_path} ({fqbn})..."
-    )));
-    let output = Command::new("arduino-cli")
+    let Some(mut command) = toolchain::command_for(Tool::ArduinoCli) else {
+        return Err(missing_tool(Tool::ArduinoCli));
+    };
+    progress!(emit, "Uploading to {port_path} for {fqbn}…");
+    command
         .args(["upload", "-p", port_path, "--fqbn", fqbn])
-        .arg(sketch_path)
-        .output()
-        .map_err(|e| format!("arduino-cli not found: {e}"))?;
+        .arg(sketch_path);
+    run_streaming(&mut command, emit)?.into_result("Upload failed")?;
+    progress!(emit, "[OK] Upload finished");
+    Ok(())
+}
 
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        emit(DeviceEvent::Progress(strip_ansi(line)));
+// ---------------------------------------------------------------------------
+// PlatformIO
+// ---------------------------------------------------------------------------
+
+fn platformio(project: &Path) -> Result<Command, String> {
+    let mut command =
+        toolchain::command_for(Tool::PlatformIo).ok_or_else(|| missing_tool(Tool::PlatformIo))?;
+    command.current_dir(project);
+    Ok(command)
+}
+
+/// Build a PlatformIO project. `environment` selects one `[env:…]` section;
+/// `None` builds the default environments.
+pub fn platformio_build(
+    project: &Path,
+    environment: Option<&str>,
+    emit: &mut dyn FnMut(DeviceEvent),
+) -> Result<(), String> {
+    let mut command = platformio(project)?;
+    command.arg("run");
+    if let Some(environment) = environment {
+        command.args(["-e", environment]);
     }
-    if output.status.success() {
-        emit(DeviceEvent::Progress("[OK] Upload successful".into()));
-        Ok(())
-    } else {
-        let err = String::from_utf8_lossy(&output.stderr).to_string();
-        Err(strip_ansi(&err))
+    progress!(emit, "Building {} with PlatformIO…", project.display());
+    run_streaming(&mut command, emit)?.into_result("PlatformIO build failed")?;
+    progress!(emit, "[OK] Build finished");
+    Ok(())
+}
+
+/// Build and upload a PlatformIO project to `port_path`.
+pub fn platformio_upload(
+    project: &Path,
+    environment: Option<&str>,
+    port_path: &str,
+    emit: &mut dyn FnMut(DeviceEvent),
+) -> Result<(), String> {
+    let mut command = platformio(project)?;
+    command.args(["run", "-t", "upload", "--upload-port", port_path]);
+    if let Some(environment) = environment {
+        command.args(["-e", environment]);
     }
+    progress!(emit, "Uploading {} to {port_path}…", project.display());
+    run_streaming(&mut command, emit)?.into_result("PlatformIO upload failed")?;
+    progress!(emit, "[OK] Upload finished");
+    Ok(())
+}
+
+/// The `[env:…]` names declared in a `platformio.ini`.
+pub fn platformio_environments(project: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(project.join("platformio.ini")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            line.strip_prefix("[env:")?
+                .strip_suffix(']')
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// ESP-IDF
+// ---------------------------------------------------------------------------
+
+fn idf(project: &Path) -> Result<Command, String> {
+    let mut command =
+        toolchain::command_for(Tool::EspIdf).ok_or_else(|| missing_tool(Tool::EspIdf))?;
+    command.current_dir(project);
+    Ok(command)
+}
+
+/// Build an ESP-IDF project for the board's chip.
+pub fn idf_build(
+    project: &Path,
+    target: &str,
+    emit: &mut dyn FnMut(DeviceEvent),
+) -> Result<(), String> {
+    // `set-target` reconfigures the build directory; it is a no-op when the
+    // target already matches, so running it first keeps the build honest
+    // after the user switches boards.
+    let mut set_target = idf(project)?;
+    set_target.args(["set-target", target]);
+    progress!(emit, "Setting the ESP-IDF target to {target}…");
+    run_streaming(&mut set_target, emit)?.into_result("Could not set the ESP-IDF target")?;
+
+    let mut command = idf(project)?;
+    command.arg("build");
+    progress!(emit, "Building {} with ESP-IDF…", project.display());
+    run_streaming(&mut command, emit)?.into_result("ESP-IDF build failed")?;
+    progress!(emit, "[OK] Build finished");
+    Ok(())
+}
+
+/// Build and flash an ESP-IDF project over `port_path`.
+pub fn idf_flash(
+    project: &Path,
+    target: &str,
+    port_path: &str,
+    emit: &mut dyn FnMut(DeviceEvent),
+) -> Result<(), String> {
+    idf_build(project, target, emit)?;
+    let mut command = idf(project)?;
+    command.args(["-p", port_path, "flash"]);
+    progress!(emit, "Flashing {} to {port_path}…", project.display());
+    run_streaming(&mut command, emit)?.into_result("ESP-IDF flash failed")?;
+    progress!(emit, "[OK] Flash finished");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -843,11 +1095,7 @@ pub struct DeviceFileEntry {
 pub fn device_fs_ls(port_path: &str, remote_path: &str) -> Result<Vec<DeviceFileEntry>, String> {
     let result = run_mpremote(port_path, &["fs", "ls", remote_path]);
     if !result.success {
-        return Err(if result.stderr.is_empty() {
-            result.stdout
-        } else {
-            result.stderr
-        });
+        return Err(result.error());
     }
     let mut entries = Vec::new();
     for line in result.stdout.lines() {
@@ -855,7 +1103,7 @@ pub fn device_fs_ls(port_path: &str, remote_path: &str) -> Result<Vec<DeviceFile
         if trimmed.is_empty() || trimmed.starts_with("Listing") || trimmed.contains("files)") {
             continue;
         }
-        let is_dir = trimmed.ends_with('/');
+        let is_directory = trimmed.ends_with('/');
         let name = trimmed
             .trim_end_matches('/')
             .rsplit('/')
@@ -868,7 +1116,7 @@ pub fn device_fs_ls(port_path: &str, remote_path: &str) -> Result<Vec<DeviceFile
         entries.push(DeviceFileEntry {
             name,
             path: trimmed.to_string(),
-            is_directory: is_dir,
+            is_directory,
             size: 0,
         });
     }
@@ -880,11 +1128,7 @@ pub fn device_fs_cat(port_path: &str, remote_path: &str) -> Result<String, Strin
     if result.success {
         Ok(result.stdout)
     } else {
-        Err(if result.stderr.is_empty() {
-            result.stdout
-        } else {
-            result.stderr
-        })
+        Err(result.error())
     }
 }
 
@@ -901,11 +1145,7 @@ pub fn device_fs_put(port_path: &str, local_path: &Path, remote_path: &str) -> R
     if result.success {
         Ok(())
     } else {
-        Err(if result.stderr.is_empty() {
-            result.stdout
-        } else {
-            result.stderr
-        })
+        Err(result.error())
     }
 }
 
@@ -914,11 +1154,24 @@ pub fn device_fs_rm(port_path: &str, remote_path: &str) -> Result<(), String> {
     if result.success {
         Ok(())
     } else {
-        Err(if result.stderr.is_empty() {
-            result.stdout
-        } else {
-            result.stderr
-        })
+        Err(result.error())
+    }
+}
+
+/// The runtime a board is actually running right now, as far as a quick probe
+/// can tell. Used to warn before overwriting a different runtime's firmware.
+pub fn probe_runtime(port_path: &str) -> Option<Runtime> {
+    let result = run_mpremote(
+        port_path,
+        &["exec", "import sys; print(sys.implementation.name)"],
+    );
+    if !result.success {
+        return None;
+    }
+    match result.stdout.trim() {
+        "micropython" => Some(Runtime::MicroPython),
+        "circuitpython" => Some(Runtime::CircuitPython),
+        _ => None,
     }
 }
 
@@ -958,14 +1211,59 @@ mod tests {
         let mut command = Command::new("python3");
         command.args(["-u", "-c", "import sys; print('progress', flush=True); sys.stderr.write('x' * 131072 + '\\nlast error'); sys.exit(3)"]);
         let mut messages = Vec::new();
-        let (status, tail) = stream_command(&mut command, &mut |DeviceEvent::Progress(line)| {
+        let outcome = run_streaming(&mut command, &mut |DeviceEvent::Progress(line)| {
             messages.push(line)
         })
         .unwrap();
-        assert_eq!(status.code(), Some(3));
+        assert_eq!(outcome.status.code(), Some(3));
         assert!(messages.iter().any(|line| line == "progress"));
-        assert!(tail.ends_with("last error\n"));
-        assert!(tail.len() <= 65536);
+        assert!(outcome.tail.ends_with("last error\n"));
+        assert!(outcome.tail.len() <= 65536);
+    }
+
+    /// esptool reports a long write by rewriting one line with carriage
+    /// returns and no newline until the end. If those only reached the UI
+    /// when the process exited, a three-minute flash would look frozen.
+    #[test]
+    fn esptool_style_progress_arrives_while_the_write_is_still_running() {
+        let mut command = Command::new("python3");
+        command.args([
+            "-u",
+            "-c",
+            concat!(
+                "import sys, time\n",
+                "for pct in (12, 47, 100):\n",
+                "    sys.stdout.write('Writing at 0x0001%04x... (%d %%)\\r' % (pct, pct))\n",
+                "    sys.stdout.flush()\n",
+                "    time.sleep(0.12)\n",
+                "sys.stdout.write('\\nHash of data verified.\\n')\n",
+            ),
+        ]);
+
+        let started = std::time::Instant::now();
+        let mut seen: Vec<(Duration, String)> = Vec::new();
+        let outcome = run_streaming(&mut command, &mut |DeviceEvent::Progress(line)| {
+            seen.push((started.elapsed(), line))
+        })
+        .unwrap();
+
+        assert!(outcome.status.success());
+        let lines: Vec<&str> = seen.iter().map(|(_, line)| line.as_str()).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "Writing at 0x0001000c... (12 %)",
+                "Writing at 0x0001002f... (47 %)",
+                "Writing at 0x00010064... (100 %)",
+                "Hash of data verified.",
+            ],
+            "each carriage-return update is its own progress line"
+        );
+        assert!(
+            seen[0].0 + Duration::from_millis(100) < seen[2].0,
+            "progress was buffered instead of streamed: {:?}",
+            seen.iter().map(|(at, _)| *at).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -983,36 +1281,81 @@ mod tests {
     }
 
     #[test]
-    fn detects_chip_type_from_flash_id() {
-        assert_eq!(
-            chip_type_from_flash_id("Detecting chip type... ESP32-S3"),
-            "ESP32_GENERIC_S3"
-        );
-        assert_eq!(chip_type_from_flash_id("nothing"), "ESP32_GENERIC");
-    }
-
-    #[test]
-    fn flash_offsets() {
-        assert_eq!(flash_offset("ESP32_GENERIC"), "0x1000");
-        assert_eq!(flash_offset("ESP32_GENERIC_S3"), "0x0");
-    }
-
-    #[test]
-    fn micropython_link_extraction() {
-        // get_micropython_url is network-bound; test the link-picking logic via
-        // a synthetic body through the same matcher it uses.
-        let body = r#"<a href="/resources/firmware/ESP32_GENERIC_S3-20240101-v1.22.0.bin">bin</a>
-                      <a href="/resources/firmware/ESP32_GENERIC_S3-20240101-v1.22.0.app-bin">ota</a>"#;
-        let links: Vec<&str> = body
-            .split('"')
-            .filter(|s| s.starts_with("/resources/firmware/"))
+    fn micropython_link_picking_prefers_the_full_image() {
+        let body = r#"<a href="/resources/firmware/ESP32_GENERIC_S3-20240101-v1.22.0.app-bin">ota</a>
+                      <a href="/resources/firmware/ESP32_GENERIC_S3-20240101-v1.22.0.bin">bin</a>"#;
+        let links: Vec<&str> = page_links(body)
+            .into_iter()
+            .filter(|link| link.starts_with("/resources/firmware/"))
             .collect();
         let pick = links
             .iter()
-            .find(|l| l.ends_with(".bin") && !l.ends_with(".app-bin"));
+            .find(|link| link.ends_with(".bin") && !link.ends_with(".app-bin"));
         assert_eq!(
             *pick.unwrap(),
             "/resources/firmware/ESP32_GENERIC_S3-20240101-v1.22.0.bin"
         );
+    }
+
+    #[test]
+    fn circuitpython_link_picking_prefers_english() {
+        let body = r#"<a href="https://downloads.circuitpython.org/bin/x/de_DE/a-de_DE-9.0.0.uf2">de</a>
+                      <a href="https://downloads.circuitpython.org/bin/x/en_US/a-en_US-9.0.0.uf2">en</a>"#;
+        let links: Vec<&str> = page_links(body)
+            .into_iter()
+            .filter(|link| link.starts_with("https://downloads.circuitpython.org/bin/"))
+            .collect();
+        let pick = links
+            .iter()
+            .find(|link| link.ends_with(".uf2") && link.contains("en_US"));
+        assert!(pick.unwrap().contains("en_US"));
+    }
+
+    #[test]
+    fn firmware_extension_follows_the_flash_method() {
+        assert_eq!(FlashMethod::Esptool.firmware_extension(), ".bin");
+        assert_eq!(
+            FlashMethod::MassStorage {
+                volume: Some("RPI-RP2"),
+                marker: crate::boards::UF2_MARKER
+            }
+            .firmware_extension(),
+            ".uf2"
+        );
+        assert_eq!(
+            FlashMethod::MassStorage {
+                volume: Some("MICROBIT"),
+                marker: crate::boards::DAPLINK_MARKER
+            }
+            .firmware_extension(),
+            ".hex"
+        );
+    }
+
+    #[test]
+    fn boot_volumes_tolerate_an_absent_mount_root() {
+        // No board is attached in CI; the probe must come back empty rather
+        // than failing.
+        let _ = boot_volumes(Some("RPI-RP2"), crate::boards::UF2_MARKER);
+    }
+
+    #[test]
+    fn platformio_environments_are_read_from_the_ini() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("platformio.ini"),
+            "[platformio]\ndefault_envs = esp32\n\n[env:esp32]\nboard = esp32dev\n\n[env:pico]\nboard = pico\n",
+        )
+        .unwrap();
+        assert_eq!(
+            platformio_environments(dir.path()),
+            vec!["esp32".to_string(), "pico".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_failed_outcome_joins_the_error_and_its_tail() {
+        let outcome = FlashOutcome::failed("Could not connect").with_hint("Hold BOOT.");
+        assert_eq!(outcome.message(), "Could not connect\nHold BOOT.");
     }
 }

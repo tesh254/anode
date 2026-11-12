@@ -7,7 +7,7 @@ use anode::workspace_state::Workspace;
 
 use gpui_kit::{actions, AppContext as _, WindowOptions};
 
-actions!(anode, [Quit, Save, SaveAll, Run, Stop, Upload]);
+actions!(anode, [Quit, Save, SaveAll, Run, Build, Stop, Upload]);
 
 /// The app icon PNG the build script rasterized from `assets/app-icon.svg`
 /// (the Electron build's `public/app-icon/macos/icon.icns` equivalent).
@@ -32,6 +32,7 @@ fn main() {
                 gpui_kit::KeyBinding::new("cmd-s", Save, None),
                 gpui_kit::KeyBinding::new("shift-cmd-s", SaveAll, None),
                 gpui_kit::KeyBinding::new("cmd-r", Run, None),
+                gpui_kit::KeyBinding::new("cmd-b", Build, None),
                 #[cfg(target_os = "macos")]
                 gpui_kit::KeyBinding::new("shift-cmd-u", Upload, None),
                 #[cfg(not(target_os = "macos"))]
@@ -160,11 +161,19 @@ fn register_workspace_actions(cx: &mut gpui_kit::App) {
         if let Some(workspace) = cx.try_global::<WorkspaceHandle>() {
             if let Some(entity) = workspace.0.upgrade() {
                 entity.update(cx, |workspace, cx| {
-                    if workspace.is_arduino() {
-                        workspace.arduino_upload();
-                    } else {
-                        workspace.upload_project();
-                    }
+                    // One command per intent: `upload_project` dispatches on
+                    // the active runtime, so the shortcut does not have to.
+                    workspace.upload_project();
+                    cx.notify();
+                });
+            }
+        }
+    });
+    cx.on_action(|_: &Build, cx| {
+        if let Some(workspace) = cx.try_global::<WorkspaceHandle>() {
+            if let Some(entity) = workspace.0.upgrade() {
+                entity.update(cx, |workspace, cx| {
+                    workspace.build_project();
                     cx.notify();
                 });
             }
