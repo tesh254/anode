@@ -1,0 +1,19 @@
+.gitignore
+  s_637d8f6102e306::t_cb8390a381ad29 1-2
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c57c58d0d4fd7bdb79a8c864976bd090a106517d",
+  "prompts": {},
+  "sessions": {
+    "s_637d8f6102e306": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1cd2e-4341-7862-962f-59d15be79f80",
+        "model": "autorouter"
+      },
+      "human_author": "ericwachira-nrny <eric.wachira@neurony.ro>"
+    }
+  }
+}
