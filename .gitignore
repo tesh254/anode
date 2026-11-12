@@ -23,3 +23,10 @@ dist-ssr
 *.sln
 *.sw?
 dist-electron/*
+
+# Native builds and generated reports
+target/
+coverage/
+playwright-report/
+test-results/
+release/
