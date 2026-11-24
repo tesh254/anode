@@ -6,7 +6,9 @@
 //! upstream provider each model comes from — so there is no separate place to
 //! pick an ACP agent.
 use crate::{
-    agent::{diagnostic_text, MessageKind, ProviderId, ProviderKind, State},
+    agent::{
+        diagnostic_text, MessageKind, ProviderId, ProviderKind, Question, QuestionOutcome, State,
+    },
     workspace_state::Workspace,
 };
 use gpui_kit::assets::IconName;
@@ -17,10 +19,17 @@ use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::dock::{BasePanel, Panel, PanelEvent};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::popover::Popover;
+use gpui_kit::component::questionnaire::{
+    Questionnaire, QuestionnaireActions, QuestionnaireChoice, QuestionnaireChoiceDefinition,
+    QuestionnaireChoices, QuestionnaireError, QuestionnaireEvent, QuestionnaireInput,
+    QuestionnaireInputDefinition, QuestionnaireItem, QuestionnaireItemDefinition,
+    QuestionnaireNext, QuestionnairePrevious, QuestionnaireProgress, QuestionnaireSkip,
+    QuestionnaireState, QuestionnaireSubmission, QuestionnaireSubmit,
+};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tag::Tag;
@@ -33,6 +42,7 @@ use gpui_kit::{
     Window,
 };
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy)]
 struct SlashCommand {
@@ -291,6 +301,301 @@ fn relative_time(millis: u64) -> String {
     }
 }
 
+// -- Agent questions ----------------------------------------------------------
+
+/// How one schema property is answered and turned back into JSON.
+#[derive(Clone, Debug)]
+enum QuestionFieldKind {
+    /// Selectable options; maps each choice value back to its constant.
+    Choice {
+        multiple: bool,
+        /// choice value → the JSON constant the agent expects back.
+        consts: HashMap<SharedString, Value>,
+    },
+    /// A typed answer: plain text or a number.
+    Freeform { number: bool },
+    /// A schema Anode cannot render as an input; never sent back.
+    Unsupported,
+}
+
+/// One schema property the question form shows.
+#[derive(Clone, Debug)]
+struct QuestionField {
+    /// The property key, which is also the questionnaire item name.
+    key: SharedString,
+    label: SharedString,
+    kind: QuestionFieldKind,
+    /// Values in choice order, for rendering.
+    choices: Vec<SharedString>,
+}
+
+/// A selectable answer with the JSON constant it submits.
+#[derive(Clone, Debug)]
+struct ChoiceEntry {
+    constant: Value,
+    title: Option<String>,
+    description: Option<String>,
+}
+
+impl ChoiceEntry {
+    fn from_one_of(entry: &Value) -> Self {
+        Self {
+            constant: entry.get("const").cloned().unwrap_or_else(|| entry.clone()),
+            title: entry["title"].as_str().map(str::to_string),
+            description: entry["description"].as_str().map(str::to_string),
+        }
+    }
+
+    fn from_enum(value: &Value) -> Self {
+        Self {
+            constant: value.clone(),
+            title: None,
+            description: None,
+        }
+    }
+}
+
+/// The live questionnaire for one pending agent question, plus the metadata
+/// needed to turn its submission back into the agent's JSON.
+struct QuestionForm {
+    state: Entity<QuestionnaireState>,
+    fields: Vec<QuestionField>,
+    _subscription: Subscription,
+}
+
+impl QuestionForm {
+    /// Turn an ACP form-mode `requestedSchema` into a questionnaire. Returns
+    /// `None` when the schema cannot be shown; the card then offers only
+    /// decline and dismiss.
+    fn build(
+        key: &str,
+        schema: &Value,
+        window: &mut Window,
+        cx: &mut Context<AgentPanel>,
+    ) -> Option<Self> {
+        let properties = schema["properties"].as_object()?;
+        if properties.is_empty() {
+            return None;
+        }
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .map(|list| list.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut fields: Vec<QuestionField> = Vec::new();
+        let mut items: Vec<QuestionnaireItemDefinition> = Vec::new();
+        for (name, property) in properties {
+            let label = property["title"]
+                .as_str()
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or(name);
+            let mut item = QuestionnaireItemDefinition::new(name.clone(), label)
+                .with_required(required.contains(&name.as_str()));
+            if let Some(description) = property["description"]
+                .as_str()
+                .filter(|text| !text.trim().is_empty())
+            {
+                item = item.with_description(description);
+            }
+            let mut field = QuestionField {
+                key: SharedString::from(name.clone()),
+                label: label.into(),
+                kind: QuestionFieldKind::Unsupported,
+                choices: Vec::new(),
+            };
+            let (multiple, entries) = if let Some(list) = property["oneOf"].as_array() {
+                (false, list.iter().map(ChoiceEntry::from_one_of).collect())
+            } else if let Some(list) = property["enum"].as_array() {
+                (false, list.iter().map(ChoiceEntry::from_enum).collect())
+            } else if property["type"] == "boolean" {
+                // The two constants the spec allows for a boolean field.
+                (
+                    false,
+                    vec![
+                        ChoiceEntry {
+                            constant: Value::Bool(true),
+                            title: Some("Yes".into()),
+                            description: None,
+                        },
+                        ChoiceEntry {
+                            constant: Value::Bool(false),
+                            title: Some("No".into()),
+                            description: None,
+                        },
+                    ],
+                )
+            } else if let Some(list) = property["items"]["anyOf"].as_array() {
+                (true, list.iter().map(ChoiceEntry::from_one_of).collect())
+            } else if let Some(list) = property["items"]["enum"].as_array() {
+                (true, list.iter().map(ChoiceEntry::from_enum).collect())
+            } else {
+                (false, Vec::new())
+            };
+            if !entries.is_empty() {
+                let mut definitions = Vec::new();
+                let mut seen: HashSet<String> = HashSet::new();
+                let mut consts = HashMap::new();
+                for entry in &entries {
+                    let value = const_value_key(&entry.constant);
+                    if !seen.insert(value.clone()) {
+                        // The questionnaire forbids duplicate choice values;
+                        // an agent that repeats one loses the question form.
+                        return None;
+                    }
+                    let choice_label = entry
+                        .title
+                        .clone()
+                        .filter(|title| !title.trim().is_empty())
+                        .unwrap_or_else(|| value.clone());
+                    let mut choice =
+                        QuestionnaireChoiceDefinition::new(value.clone(), choice_label);
+                    if let Some(description) = entry
+                        .description
+                        .as_deref()
+                        .filter(|text| !text.trim().is_empty())
+                    {
+                        choice = choice.with_description(description);
+                    }
+                    let default = &property["default"];
+                    let selected = if multiple {
+                        default
+                            .as_array()
+                            .is_some_and(|list| list.contains(&entry.constant))
+                    } else {
+                        *default == entry.constant
+                    };
+                    if selected {
+                        choice = choice.with_default_selected(true);
+                    }
+                    consts.insert(value.clone().into(), entry.constant.clone());
+                    definitions.push(choice);
+                    field.choices.push(value.into());
+                }
+                item = item.with_multiple(multiple).with_choices(definitions);
+                field.kind = QuestionFieldKind::Choice { multiple, consts };
+            } else if matches!(
+                property["type"].as_str(),
+                Some("string") | Some("number") | Some("integer") | None
+            ) {
+                // A typed answer. A missing `type` with no choices is text:
+                // agents may omit `type` for freeform fields.
+                let number = matches!(property["type"].as_str(), Some("number") | Some("integer"));
+                let input = cx.new(|cx| {
+                    InputState::new(window, cx).placeholder(if number {
+                        "Type a number"
+                    } else {
+                        "Type your answer"
+                    })
+                });
+                if let Some(default) = property["default"].as_str() {
+                    input.update(cx, |state, cx| state.set_value(default, window, cx));
+                }
+                if number {
+                    item = item.with_validator(move |context| {
+                        match context
+                            .answer()
+                            .freeform()
+                            .and_then(|text| text.parse::<f64>().ok())
+                        {
+                            Some(_) => Ok(()),
+                            None => Err("Enter a number.".into()),
+                        }
+                    });
+                }
+                item = item.with_input(QuestionnaireInputDefinition::new(
+                    input,
+                    field.label.clone(),
+                ));
+                field.kind = QuestionFieldKind::Freeform { number };
+            } else {
+                // An unknown or nested type must not render as a known
+                // control; the question can still be declined or dismissed.
+                let note = "Anode cannot answer this field type.";
+                let description = item
+                    .description()
+                    .map(SharedString::to_string)
+                    .map(|text| format!("{text}\n{note}"))
+                    .unwrap_or_else(|| note.into());
+                item = item.with_description(description);
+            }
+            fields.push(field);
+            items.push(item);
+        }
+        let state = cx.new(|cx| {
+            QuestionnaireState::new(items, cx).expect("question fields are pre-validated")
+        });
+        let fields_for_submit = fields.clone();
+        let key = SharedString::from(key);
+        let subscription = cx.subscribe_in(
+            &state,
+            window,
+            move |this, _, event: &QuestionnaireEvent, window, cx| {
+                if let QuestionnaireEvent::Submit(submission) = event {
+                    let content = question_content(&fields_for_submit, submission);
+                    this.answer_question(&key, QuestionOutcome::Accept(content), window, cx);
+                }
+            },
+        );
+        Some(Self {
+            state,
+            fields,
+            _subscription: subscription,
+        })
+    }
+}
+
+/// The questionnaire's choice value for a JSON constant.
+fn const_value_key(constant: &Value) -> String {
+    match constant {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Turn a questionnaire submission into the elicitation response `content`.
+fn question_content(fields: &[QuestionField], submission: &QuestionnaireSubmission) -> Value {
+    let mut content = serde_json::Map::new();
+    for item in submission.items() {
+        let Some(field) = fields.iter().find(|field| &field.key == item.name()) else {
+            continue;
+        };
+        let answer = item.answer();
+        if answer.is_empty() {
+            continue;
+        }
+        match &field.kind {
+            QuestionFieldKind::Choice { multiple, consts } => {
+                let selected = answer.choices();
+                if *multiple {
+                    let values: Vec<Value> = selected
+                        .iter()
+                        .filter_map(|value| consts.get(value).cloned())
+                        .collect();
+                    content.insert(field.key.to_string(), Value::Array(values));
+                } else if let Some(constant) = selected
+                    .first()
+                    .and_then(|value| consts.get(value).cloned())
+                {
+                    content.insert(field.key.to_string(), constant);
+                }
+            }
+            QuestionFieldKind::Freeform { number } => {
+                let Some(text) = answer.freeform() else {
+                    continue;
+                };
+                if *number {
+                    if let Ok(parsed) = text.parse::<f64>() {
+                        content.insert(field.key.to_string(), parsed.into());
+                    }
+                } else {
+                    content.insert(field.key.to_string(), text.to_string().into());
+                }
+            }
+            QuestionFieldKind::Unsupported => {}
+        }
+    }
+    Value::Object(content)
+}
+
 // -- Panel ------------------------------------------------------------------
 
 pub(super) struct AgentPanel {
@@ -304,6 +609,10 @@ pub(super) struct AgentPanel {
     syncing: bool,
     subscriptions: Vec<Subscription>,
     expanded_tools: std::collections::HashSet<u64>,
+    /// Live questionnaires keyed by pending question key.
+    question_forms: HashMap<String, QuestionForm>,
+    /// Questions whose form could not be built; shown as decline-only cards.
+    failed_forms: HashSet<String>,
 }
 
 impl AgentPanel {
@@ -323,6 +632,20 @@ impl AgentPanel {
         let workspace = owner.upgrade().expect("workspace exists");
         let observation = cx.observe_in(&workspace, window, |this, owner, window, cx| {
             let workspace = owner.read(cx);
+            // Owned copies of everything the closure needs: entity creation
+            // below requires `cx` exclusively, so `workspace` must not be
+            // borrowed across it.
+            let pending_questions: Vec<(String, Value)> = workspace
+                .agents
+                .current()
+                .map(|conversation| {
+                    conversation
+                        .questions
+                        .iter()
+                        .map(|question| (question.key.clone(), question.schema.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
             let key = format!(
                 "{:?}:{:?}",
                 workspace.agents.selected_id(),
@@ -338,9 +661,12 @@ impl AgentPanel {
                 .current()
                 .map(|c| c.messages.len())
                 .unwrap_or(0);
+            this.sync_question_forms(&pending_questions, window, cx);
             let draft_changed = this.draft.read(cx).value().as_ref() != draft;
             if this.binding != key || draft_changed {
                 this.expanded_tools.clear();
+                // Question forms are keyed by pending question and retired by
+                // `sync_question_forms`, which already ran against this state.
                 this.binding = key;
                 this.syncing = true;
                 this.draft
@@ -390,7 +716,193 @@ impl AgentPanel {
             syncing: false,
             subscriptions: vec![observation, changes],
             expanded_tools: Default::default(),
+            question_forms: HashMap::new(),
+            failed_forms: HashSet::new(),
         }
+    }
+
+    /// Build and retire question form state as the agent asks and the user
+    /// answers. Each pending question gets one questionnaire entity, created
+    /// here rather than during render.
+    fn sync_question_forms(
+        &mut self,
+        pending: &[(String, Value)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keys: Vec<&str> = pending.iter().map(|(key, _)| key.as_str()).collect();
+        self.question_forms
+            .retain(|key, _| keys.contains(&key.as_str()));
+        self.failed_forms.retain(|key| keys.contains(&key.as_str()));
+        for (key, schema) in pending {
+            if self.question_forms.contains_key(key) || self.failed_forms.contains(key) {
+                continue;
+            }
+            match QuestionForm::build(key, schema, window, cx) {
+                Some(form) => {
+                    self.question_forms.insert(key.clone(), form);
+                }
+                None => {
+                    self.failed_forms.insert(key.clone());
+                }
+            }
+        }
+    }
+
+    /// Resolve the pending question `key` with `outcome` and return focus to
+    /// the composer, mirroring how permission buttons hand focus back.
+    fn answer_question(
+        &mut self,
+        key: &SharedString,
+        outcome: QuestionOutcome,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus = self.draft.read(cx).focus_handle(cx);
+        if let Some(owner) = self.owner.upgrade() {
+            owner.update(cx, |workspace, cx| {
+                if let Some(conversation) = workspace.agents.current_mut() {
+                    if let Some(index) = conversation
+                        .questions
+                        .iter()
+                        .position(|question| question.key == key.as_ref())
+                    {
+                        let question = conversation.questions.remove(index);
+                        let _ = question.reply.send(outcome);
+                    }
+                }
+                cx.notify();
+            });
+        }
+        self.question_forms.remove(key.as_ref());
+        self.failed_forms.remove(key.as_ref());
+        focus.focus(window, cx);
+    }
+
+    /// The pending-question card: the agent's message, its answer form, and
+    /// the decline and dismiss controls the elicitation spec requires.
+    fn render_question_card(
+        &self,
+        question: &Question,
+        cx: &Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let key: SharedString = question.key.clone().into();
+        let mut card = v_flex()
+            .mx_3()
+            .mb_2()
+            .p_2()
+            .gap_2()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(Icon::new(IconName::MessageCircleQuestionMark).size_3())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(question.message.clone()),
+                    )
+                    .child(Tag::secondary().small().child("Agent question")),
+            );
+        if let Some(form) = self.question_forms.get(&question.key) {
+            let state = form.state.clone();
+            let current_item = state.read(cx).current_item().cloned();
+            let mut questionnaire = Questionnaire::new(&state)
+                .small()
+                .child(QuestionnaireProgress::new(&state).small());
+            if let Some(item_name) = current_item {
+                if let Some(field) = form.fields.iter().find(|field| field.key == item_name) {
+                    let definition = state.read(cx).item_definition(&item_name);
+                    let mut item = QuestionnaireItem::new(&state, item_name.clone()).child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(field.label.clone()),
+                    );
+                    if let Some(description) =
+                        definition.and_then(|definition| definition.description().cloned())
+                    {
+                        item = item.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(description),
+                        );
+                    }
+                    if !field.choices.is_empty() {
+                        item = item.child(
+                            QuestionnaireChoices::new(&state, item_name.clone()).children(
+                                field
+                                    .choices
+                                    .iter()
+                                    .map(|value| {
+                                        QuestionnaireChoice::new(
+                                            &state,
+                                            item_name.clone(),
+                                            value.clone(),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>(),
+                            ),
+                        );
+                    }
+                    // Renders only when this item has a typed-answer input.
+                    item = item.child(QuestionnaireInput::new(&state, item_name.clone()));
+                    item = item.child(QuestionnaireError::new(&state, item_name.clone()));
+                    questionnaire = questionnaire.child(item);
+                }
+            }
+            card = card.child(questionnaire).child(
+                QuestionnaireActions::new(&state)
+                    .child(QuestionnairePrevious::new(&state).small())
+                    .child(QuestionnaireSkip::new(&state).small())
+                    .child(QuestionnaireNext::new(&state).small())
+                    .child(QuestionnaireSubmit::new(&state).small()),
+            );
+        } else {
+            card = card.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("This question's answer form could not be displayed."),
+            );
+        }
+        let decline_key = key.clone();
+        let dismiss_key = key.clone();
+        card.child(
+            h_flex()
+                .gap_1()
+                .child(
+                    Button::new(SharedString::from(format!("agent-question-decline-{key}")))
+                        .label("Decline")
+                        .outline()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.answer_question(
+                                &decline_key,
+                                QuestionOutcome::Decline,
+                                window,
+                                cx,
+                            );
+                        })),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("agent-question-dismiss-{key}")))
+                        .label("Dismiss")
+                        .outline()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.answer_question(&dismiss_key, QuestionOutcome::Cancel, window, cx);
+                        })),
+                ),
+        )
+        .into_any_element()
     }
 
     fn attach(&mut self, source: AttachSource, window: &mut Window, cx: &mut Context<Self>) {
@@ -1491,8 +2003,11 @@ impl Render for AgentPanel {
 
         // -- Pending approvals ------------------------------------------------
         let mut approvals = v_flex();
+        let question = conversation.and_then(|c| c.questions.first());
         let permission = conversation.and_then(|c| c.permissions.first());
-        if let Some(permission) = permission {
+        if let Some(question) = question {
+            approvals = approvals.child(self.render_question_card(question, cx));
+        } else if let Some(permission) = permission {
             let title = permission
                 .request
                 .tool_call
@@ -2059,6 +2574,134 @@ mod tests {
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
             assert!(window.find("agent-connect").visible());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_pending_question_renders_its_form_and_answers_through_it(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{px, size, Bounds, WindowBounds, WindowOptions};
+        assert!(ui_config_directory().is_dir());
+        cx.update(gpui_kit::init);
+        let (handle, workspace) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        Default::default(),
+                        size(px(1180.), px(700.)),
+                    ))),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    let workspace = cx.new(|cx| Workspace::new(window, cx));
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.settings.agent_auto_connect = false;
+                        workspace.initialize_panels(window, cx);
+                        workspace.show_tool(crate::panels::Tool::Agent, window, cx);
+                    });
+                    workspace
+                },
+            )
+            .unwrap()
+        });
+        cx.run_until_parked();
+
+        // A turn in flight asks the user for direction, the way OpenCode's
+        // question tool does over ACP elicitation.
+        let mut outcome = cx.update(|cx| {
+            workspace.update(cx, |workspace, cx| {
+                assert!(workspace.agents.select(&ProviderId::opencode()));
+                let conversation = workspace.agents.current_mut().unwrap();
+                conversation.state = State::Responding;
+                let (reply, outcome) = tokio::sync::oneshot::channel();
+                conversation.questions.push(Question {
+                    key: "17".into(),
+                    message: "Which runtime should the project use?".into(),
+                    schema: json!({
+                        "type": "object",
+                        "properties": {"runtime": {
+                            "type": "string",
+                            "title": "Runtime",
+                            "oneOf": [
+                                {"const": "micropython", "title": "MicroPython"},
+                                {"const": "circuitpython", "title": "CircuitPython"}
+                            ]
+                        }},
+                        "required": ["runtime"]
+                    }),
+                    reply,
+                });
+                cx.notify();
+                outcome
+            })
+        });
+        cx.run_until_parked();
+
+        // The panel built one questionnaire for the pending question.
+        let state = cx.update(|cx| {
+            let panel = workspace
+                .read(cx)
+                .panels
+                .as_ref()
+                .expect("panels initialized")
+                .agent
+                .clone();
+            let panel = panel.read(cx);
+            assert!(panel.question_forms.contains_key("17"));
+            assert!(panel.failed_forms.is_empty());
+            panel
+                .question_forms
+                .get("17")
+                .expect("the question form exists")
+                .state
+                .clone()
+        });
+        let entity = state.entity_id();
+        let choice: &'static str =
+            Box::leak(format!("questionnaire-{entity}-choice-runtime-circuitpython").into());
+        let submit: &'static str = Box::leak(format!("questionnaire-{entity}-Submit").into());
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.find("agent-question-decline-17").visible(),
+                "the question card is on screen"
+            );
+            window.click(choice, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(submit, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            workspace.update(cx, |workspace, cx| {
+                let conversation = workspace.agents.current().expect("conversation");
+                assert!(
+                    conversation.questions.is_empty(),
+                    "answering resolves the pending question"
+                );
+                cx.notify();
+            });
+        });
+        assert_eq!(
+            outcome.try_recv().unwrap(),
+            QuestionOutcome::Accept(json!({"runtime": "circuitpython"}))
+        );
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("agent-question-decline-17").is_none(),
+                "the card leaves with the answered question"
+            );
         })
         .unwrap();
     }

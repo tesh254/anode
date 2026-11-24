@@ -201,6 +201,29 @@ pub(crate) struct Permission {
     pub(crate) reply: oneshot::Sender<agent_client_protocol::RequestPermissionResponse>,
 }
 
+/// What the user did with an agent question.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum QuestionOutcome {
+    /// The user submitted answers; carries the `content` object.
+    Accept(Value),
+    /// The user explicitly declined to answer.
+    Decline,
+    /// The user dismissed the question, or it was cancelled.
+    Cancel,
+}
+
+/// One `elicitation/create` request the agent is waiting on. OpenCode asks for
+/// user direction this way when the model uses its `question` tool.
+pub(crate) struct Question {
+    /// Identifies the pending request within this connection.
+    pub(crate) key: String,
+    /// What the agent asked, verbatim.
+    pub(crate) message: String,
+    /// The agent-requested JSON Schema for the answer form.
+    pub(crate) schema: Value,
+    pub(crate) reply: oneshot::Sender<QuestionOutcome>,
+}
+
 pub(crate) struct ToolRequest {
     pub(crate) name: String,
     pub(crate) arguments: Value,
@@ -219,6 +242,7 @@ pub(crate) enum Event {
     Ready(String, Value),
     Update(Value),
     Permission(Box<Permission>),
+    Question(Box<Question>),
     Tool(ToolRequest),
     Diagnostic(String),
     TurnError(String),
@@ -276,6 +300,7 @@ pub(crate) struct Conversation {
     pub(crate) messages: Vec<Message>,
     pub(crate) diagnostics: Vec<String>,
     pub(crate) permissions: Vec<Permission>,
+    pub(crate) questions: Vec<Question>,
     pub(crate) tool_requests: Vec<ToolRequest>,
     pub(crate) session: Option<String>,
     pub(crate) options: Value,
@@ -295,6 +320,7 @@ impl Default for Conversation {
             messages: Vec::new(),
             diagnostics: Vec::new(),
             permissions: Vec::new(),
+            questions: Vec::new(),
             tool_requests: Vec::new(),
             session: None,
             options: Value::Null,
@@ -329,6 +355,7 @@ impl Conversation {
 
     pub(crate) fn disconnect(&mut self) {
         self.permissions.clear(); // Dropped replies resolve as cancelled in the client.
+        self.questions.clear(); // Dropped replies resolve as cancelled in the pump.
         self.tool_requests.clear();
         self.connection = None;
         for job in self.terminal_jobs.values() {
@@ -376,6 +403,7 @@ impl Conversation {
     pub(crate) fn stop(&mut self) {
         if self.state == State::Responding {
             self.permissions.clear();
+            self.questions.clear();
             self.tool_requests.clear();
             for job in self.terminal_jobs.values() {
                 job.cancel();
@@ -434,55 +462,76 @@ impl Conversation {
                 .as_ref()
                 .and_then(|c| c.events.try_recv().ok());
             let Some(event) = event else { break };
-            self.revision = self.revision.wrapping_add(1);
-            match event {
-                Event::State(state) => self.state = state,
-                Event::Ready(id, options) => {
-                    self.session = Some(id);
-                    self.options = options;
-                    self.state = State::Ready;
-                }
-                Event::Diagnostic(text) => {
-                    self.diagnostics.push(text);
-                    if self.diagnostics.len() > 12 {
-                        self.diagnostics.remove(0);
-                    }
-                }
-                Event::TurnError(error) => {
-                    self.permissions.clear();
-                    self.tool_requests.clear();
-                    let message = if error.to_lowercase().contains("authentication") {
-                        format!(
-                            "{error}\n\nThis model needs authentication. Pick another model from the Model menu below, or run login in Agent Settings."
-                        )
-                    } else {
-                        error
-                    };
-                    self.push(MessageKind::Error, message);
-                    self.state = State::Ready;
-                }
-                Event::Failed(error) => {
-                    self.push(MessageKind::Error, error);
-                    self.disconnect();
-                    self.state = State::Failed;
-                    break;
-                }
-                Event::Finished(reason) => {
-                    self.permissions.clear();
-                    self.tool_requests.clear();
-                    self.push(MessageKind::Status, reason);
-                    self.state = State::Ready;
-                }
-                Event::Permission(permission) => {
-                    if self.state == State::Responding {
-                        self.permissions.push(*permission);
-                    }
-                }
-                Event::Tool(tool) => tools.push(tool),
-                Event::Update(update) => self.update(update),
+            if let Some(tool) = self.drain_events(event) {
+                tools.push(tool);
+            }
+            if self.state == State::Failed {
+                break;
             }
         }
         tools
+    }
+
+    /// Apply one transport event to the conversation; returns a tool request
+    /// when the event was one the workspace must run.
+    pub(crate) fn drain_events(&mut self, event: Event) -> Option<ToolRequest> {
+        self.revision = self.revision.wrapping_add(1);
+        let mut tool = None;
+        match event {
+            Event::State(state) => self.state = state,
+            Event::Ready(id, options) => {
+                self.session = Some(id);
+                self.options = options;
+                self.state = State::Ready;
+            }
+            Event::Diagnostic(text) => {
+                self.diagnostics.push(text);
+                if self.diagnostics.len() > 12 {
+                    self.diagnostics.remove(0);
+                }
+            }
+            Event::TurnError(error) => {
+                self.permissions.clear();
+                self.questions.clear();
+                self.tool_requests.clear();
+                let message = if error.to_lowercase().contains("authentication") {
+                    format!(
+                        "{error}\n\nThis model needs authentication. Pick another model from the Model menu below, or run login in Agent Settings."
+                    )
+                } else {
+                    error
+                };
+                self.push(MessageKind::Error, message);
+                self.state = State::Ready;
+            }
+            Event::Failed(error) => {
+                self.push(MessageKind::Error, error);
+                self.disconnect();
+                self.state = State::Failed;
+            }
+            Event::Finished(reason) => {
+                self.permissions.clear();
+                self.questions.clear();
+                self.tool_requests.clear();
+                self.push(MessageKind::Status, reason);
+                self.state = State::Ready;
+            }
+            Event::Permission(permission) => {
+                if self.state == State::Responding {
+                    self.permissions.push(*permission);
+                }
+            }
+            // A question dropped here (not in a responding turn) loses its
+            // reply channel, which the transport answers as cancelled.
+            Event::Question(question) => {
+                if self.state == State::Responding {
+                    self.questions.push(*question);
+                }
+            }
+            Event::Tool(request) => tool = Some(request),
+            Event::Update(update) => self.update(update),
+        }
+        tool
     }
 
     fn update(&mut self, update: Value) {
@@ -1131,5 +1180,87 @@ mod tests {
         assert!(!service.saved_chats().iter().any(|chat| chat.id == id));
         assert_eq!(service.saved_chats().len(), 1);
         assert!(!service.delete_chat(&id));
+    }
+
+    fn question(key: &str) -> (Question, oneshot::Receiver<QuestionOutcome>) {
+        let (reply, outcome) = oneshot::channel();
+        (
+            Question {
+                key: key.into(),
+                message: "Which runtime?".into(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"runtime": {"type": "string", "oneOf": [
+                        {"const": "micropython", "title": "MicroPython"},
+                        {"const": "circuitpython", "title": "CircuitPython"}
+                    ]}},
+                    "required": ["runtime"]
+                }),
+                reply,
+            },
+            outcome,
+        )
+    }
+
+    #[test]
+    fn a_question_arriving_in_a_turn_is_kept_until_it_is_answered() {
+        let mut service = service();
+        service.bind(Some("/project".into()));
+        let conversation = service.current_mut().unwrap();
+        conversation.state = State::Responding;
+        let (pending, outcome) = question("17");
+        let _ = conversation.drain_events(Event::Question(Box::new(pending)));
+
+        let conversation = service.current_mut().unwrap();
+        assert_eq!(conversation.questions.len(), 1);
+        // Answering through the UI's reply channel carries the selection.
+        let pending = conversation.questions.remove(0);
+        pending
+            .reply
+            .send(QuestionOutcome::Accept(
+                serde_json::json!({"runtime": "micropython"}),
+            ))
+            .unwrap();
+        assert_eq!(
+            outcome.blocking_recv().unwrap(),
+            QuestionOutcome::Accept(serde_json::json!({"runtime": "micropython"}))
+        );
+        assert!(conversation.questions.is_empty());
+    }
+
+    #[test]
+    fn questions_outside_a_turn_are_cancelled_and_turn_end_clears_pending_ones() {
+        let mut service = service();
+        service.bind(Some("/project".into()));
+        // Not responding: the question is dropped, which cancels it in the pump.
+        let (pending, mut outcome) = question("18");
+        let conversation = service.current_mut().unwrap();
+        let _ = conversation.drain_events(Event::Question(Box::new(pending)));
+        assert!(conversation.questions.is_empty());
+        assert!(
+            outcome.try_recv().is_err(),
+            "the dropped reply cancels upstream"
+        );
+
+        // Responding: the turn ends, and the pending question resolves as cancelled.
+        let conversation = service.current_mut().unwrap();
+        conversation.state = State::Responding;
+        let (pending, mut outcome) = question("19");
+        let _ = conversation.drain_events(Event::Question(Box::new(pending)));
+        let _ = conversation.drain_events(Event::Finished("Turn ended: end_turn".into()));
+        assert!(conversation.questions.is_empty());
+        assert!(
+            outcome.try_recv().is_err(),
+            "the dropped reply cancels upstream"
+        );
+        assert_eq!(conversation.state, State::Ready);
+
+        // Stop clears a pending question the same way.
+        let conversation = service.current_mut().unwrap();
+        conversation.state = State::Responding;
+        let (pending, _) = question("20");
+        let _ = conversation.drain_events(Event::Question(Box::new(pending)));
+        conversation.stop();
+        assert!(conversation.questions.is_empty());
     }
 }

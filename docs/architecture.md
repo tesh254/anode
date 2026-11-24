@@ -166,6 +166,18 @@ to. A choice is saved in `Settings::agent_provider` and restored on the next
 launch only while that provider is still configured and still resolves to an
 executable.
 
+When the agent asks for direction mid-turn — OpenCode's `question` tool sends
+ACP `elicitation/create` — the conversation shows a question card with the
+agent's message and a small form: choice lists from the request's restricted
+JSON Schema (single- or multi-select, booleans, typed text and numbers), plus
+**Decline** and **Dismiss**. The pinned `agent-client-protocol` 0.10.2 crate
+predates elicitation, so `src/agent/transport.rs` advertises
+`elicitation.form` by patching the outgoing `initialize` frame once, diverts
+`elicitation/create` lines before the SDK would answer them with
+method-not-found, and writes the JSON-RPC response itself. A dropped or
+unanswered question resolves as `cancel`, so the agent continues without an
+answer instead of stalling.
+
 ## Settings
 
 `src/panels/settings.rs` is a full-window destination with its own sidebar,

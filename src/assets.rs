@@ -23,6 +23,7 @@ gpui_kit::assets::icon_assets!(
         Files,
         Hammer,
         LogIn,
+        MessageCircleQuestionMark,
         MessagesSquare,
         Microchip,
         PanelsTopLeft,
