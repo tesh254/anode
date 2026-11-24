@@ -22,6 +22,7 @@ UI.
 | `src/panels/` | Dockable tools, the board catalog browser, per-board jobs and persisted layouts |
 | `src/hardware.rs` | Physical device identity, connection history and shared port leases |
 | `src/repl.rs` | Interactive serial connection and reader/writer threads |
+| `src/recovery.rs` | Connection-failure classification and runtime/board recovery guidance |
 | `src/settings.rs` | Configuration JSON and recent projects/devices |
 | `src/theme.rs` | Neutral light/dark surfaces, green commands, and the console palette |
 | `scripts/bundle-macos.sh` | Release build, `.icns`, Info.plist and development signing |
@@ -87,6 +88,17 @@ result is cached. It re-runs after any job that could change what is installed.
 Tool lookup searches `PATH` plus the directories a GUI process started from the
 Dock does not inherit — Homebrew, `~/.local/bin`, pip's user bin.
 
+Recognized serial, raw-REPL, bootloader and USB-volume failures expose **How to
+fix** in a workspace notice and in per-board task panels. **Connection help**
+remains available in the Board panel even before a failure. The shared dialog
+in `src/views/recovery.rs` explains the failure, lists checks for the selected
+runtime, and offers rescan, REPL, Board setup and diagnostic-copy actions.
+Background operations capture their original port, runtime and board for this
+guidance. Unknown or generic board models get an identification step rather
+than a guessed bootloader sequence. The guide does not retry writes, install
+firmware or assert that a busy port is the confirmed cause of a handshake
+timeout.
+
 ## Editing and persistence
 
 The component-layer GPUI editor installs the highlighter for the open file's
@@ -135,13 +147,44 @@ history.
 
 ## Agent side chat
 
-The right dock groups **Board** and **Agent** as tabs. Agent is a retained
-panel (`src/panels/agent.rs`) with an agent selector, workspace context labels,
-conversation empty state and multiline draft. Drafts and selections survive tab
-switches. The activity bar reopens the panel, and existing version-3 layouts
-gain its tab without resetting pane arrangements.
+The right dock switches between **Board** and **Agent** from the activity bar,
+showing one panel at a time. Agent is a retained
+panel (`src/panels/agent.rs`): a compact header with chat history and the
+connection menu, the transcript, and a composer that holds the agent menu, a
+searchable model palette grouped by the upstream provider each model comes
+from, the remaining ACP session options, and the draft. **OpenCode Go** is
+the first model group, followed by **OpenCode Zen**, then the current upstream
+provider and the others alphabetically. The selected-model button also names
+Go or Zen so identical model names remain distinguishable. This ordering
+does not change the selected model. Drafts and selections survive panel
+switches. Existing version-3 layouts gain the Agent panel without resetting
+pane arrangements.
 
-ACP transport is not implemented yet: the UI shows Not connected and disables
-Send. The intended connected conversation and engineering tools are specified
-in [ACP integration](acp-integration.md) and
+Chat never chooses an agent. Until the user picks one the panel shows an empty
+state that opens Settings, and no composer, because there is nothing to send
+to. A choice is saved in `Settings::agent_provider` and restored on the next
+launch only while that provider is still configured and still resolves to an
+executable.
+
+## Settings
+
+`src/panels/settings.rs` is a full-window destination with its own sidebar,
+opened by the cog at the bottom of the activity bar. Its **Providers** page is a master–detail over the
+provider registry (`src/agent/profiles.rs`): Codex and OpenCode ship as
+built-ins, and any other stdio ACP agent can be added as a custom provider with
+its own command, arguments and environment — which is also where a base URL and
+API key for an OpenAI- or Anthropic-compatible endpoint go. The registry lives
+in `<config>/anode/agents/providers.json`, written `0600` because it can hold
+those keys.
+
+Install and sign-in state always come from the provider's own commands, never
+from the presence of a binary. `src/agent/install.rs` runs `npm install -g` and
+the provider's sign-in as managed child processes and streams their output into
+the page, so a failure is visible instead of disappearing into a terminal.
+OpenCode's sign-in is an interactive picker and is opened in the Terminal panel
+instead. The **Agent** page covers automatic connection and transcript history;
+**Diagnostics** shows the current session's transport log.
+
+The connected conversation and engineering tools are specified in
+[ACP integration](acp-integration.md) and
 [engineering tools](agent-engineering-tools.md).

@@ -159,14 +159,17 @@ impl Workspace {
             sections.push(self.render_firmware_section(cx).into_any_element());
         } else {
             sections.push(
-                GroupBox::new().outline()
+                GroupBox::new()
+                    .outline()
                     .outline()
                     .title(section_header(IconName::Sparkles, "Setup", cx))
                     .child(
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child("Runtime, toolchain and firmware appear once a board is chosen."),
+                            .child(
+                                "Runtime, toolchain and firmware appear once a board is chosen.",
+                            ),
                     )
                     .into_any_element(),
             );
@@ -231,7 +234,8 @@ impl Workspace {
             cx,
         );
 
-        GroupBox::new().outline()
+        GroupBox::new()
+            .outline()
             .title(
                 h_flex()
                     .w_full()
@@ -288,6 +292,15 @@ impl Workspace {
                                         this.repl_connect();
                                         this.show_tool(Tool::Repl, window, cx);
                                     })),
+                            )
+                            .child(
+                                Button::new("device-connection-help")
+                                    .label("Connection help…")
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.show_connection_help(window, cx);
+                                    })),
                             ),
                     ),
             )
@@ -298,6 +311,28 @@ impl Workspace {
         let board = self.active_board();
         let connected = self.is_connected();
         let is_arduino = self.active_runtime() == Runtime::Arduino;
+        let probing = self.chip_probe_running();
+        let port = self.selected_port_identity();
+        // Asking the chip is only offered where it could still answer
+        // something new; a pinned board, or one a product id named outright,
+        // has nothing left to learn.
+        let can_probe = port
+            .as_ref()
+            .is_some_and(|port| self.chip_probe_is_useful(port))
+            && !self.device_busy;
+        let chip_detail = port
+            .as_ref()
+            .and_then(|port| self.chip_report_for(port))
+            .map(crate::esp::ChipReport::summary);
+        let probe_failure = match self.chip_probe() {
+            Some(crate::workspace_state::ChipProbe::Silent) => Some(
+                "No Espressif chip answered on this port, so the model below is a guess from the \
+                 USB descriptor."
+                    .to_string(),
+            ),
+            Some(crate::workspace_state::ChipProbe::Failed(detail)) => Some(detail.clone()),
+            _ => None,
+        };
         let picker = picker_or_placeholder(
             self.pickers.board.as_ref(),
             "Search boards or chips…",
@@ -327,15 +362,57 @@ impl Workspace {
                 v_flex()
                     .gap_3()
                     .child(picker)
-                    .when(!resolved.exact && !resolved.from_override && connected, |this| {
+                    .when(probing, |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().info)
+                                .child("Asking the chip what it is…"),
+                        )
+                    })
+                    .when_some(chip_detail.clone(), |this, detail| {
+                        this.child(detail_row("Reported", detail, cx))
+                    })
+                    .when_some(probe_failure.clone(), |this, failure| {
                         this.child(
                             div()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(
-                                    "This USB descriptor is shared across a whole chip family. \
-                                     Pick your exact board and Anode remembers it.",
-                                ),
+                                .child(failure),
+                        )
+                    })
+                    .when(
+                        !probing
+                            && !resolved.exact
+                            && !resolved.from_override
+                            && !resolved.probed
+                            && connected,
+                        |this| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(
+                                        "A USB-serial adapter cannot name the chip behind it. Ask \
+                                         the board, or pick your exact model and Anode remembers \
+                                         it.",
+                                    ),
+                            )
+                        },
+                    )
+                    .when(can_probe, |this| {
+                        this.child(
+                            Button::new("board-identify")
+                                .label("Identify chip")
+                                .icon(IconName::Microchip)
+                                .outline()
+                                .small()
+                                .loading(probing)
+                                .disabled(probing)
+                                .tooltip("Reset the board into its bootloader and read its chip")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.probe_chip(true, cx);
+                                })),
                         )
                     })
                     .when_some(board, |this, board| {
@@ -484,7 +561,8 @@ impl Workspace {
             }
         };
 
-        GroupBox::new().outline()
+        GroupBox::new()
+            .outline()
             .title(section_header(IconName::Workflow, "Runtime", cx))
             .child(
                 v_flex()
@@ -504,24 +582,21 @@ impl Workspace {
                                 h_flex()
                                     .gap_4()
                                     .flex_wrap()
-                                    .when(
-                                        layout.show_device_files && self.is_connected(),
-                                        |row| {
-                                            row.child(
-                                                v_flex()
-                                                    .flex_1()
-                                                    .min_w(rems(7.5))
-                                                    .gap_0p5()
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(cx.theme().muted_foreground)
-                                                            .child("Board filesystem"),
-                                                    )
-                                                    .child(div().text_xs().child("Available")),
-                                            )
-                                        },
-                                    )
+                                    .when(layout.show_device_files && self.is_connected(), |row| {
+                                        row.child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w(rems(7.5))
+                                                .gap_0p5()
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child("Board filesystem"),
+                                                )
+                                                .child(div().text_xs().child("Available")),
+                                        )
+                                    })
                                     .when(
                                         self.project_kind != crate::project::ProjectKind::Unknown,
                                         |row| {
@@ -555,7 +630,8 @@ impl Workspace {
         let scanning = self.tools_scanning;
         let busy = self.device_busy;
 
-        GroupBox::new().outline()
+        GroupBox::new()
+            .outline()
             .title(
                 h_flex()
                     .w_full()
@@ -658,7 +734,8 @@ impl Workspace {
 
     fn render_firmware_section(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(board) = self.active_board() else {
-            return GroupBox::new().outline()
+            return GroupBox::new()
+                .outline()
                 .title(section_header(IconName::Zap, "Firmware", cx))
                 .child(
                     div()
@@ -677,6 +754,17 @@ impl Workspace {
         );
         let ready = !busy && (connected || !needs_port);
         let supported = board.flash != FlashMethod::Unsupported;
+        // The one action worth emphasising names the exact build it will
+        // write, because that build was chosen from what the chip reported
+        // rather than from anything the user picked.
+        let micropython_build = self
+            .flash_request(FirmwareSource::MicroPython)
+            .map(|request| request.image_label());
+        let plan_detail = self
+            .flash_request(FirmwareSource::MicroPython)
+            .and_then(|request| request.plan())
+            .map(|plan| plan.detail());
+        let running = self.device_busy.then(|| self.flash_phase());
 
         GroupBox::new().outline()
             .title(section_header(IconName::Zap, "Firmware", cx))
@@ -697,6 +785,17 @@ impl Workspace {
                     })
                     .when(supported, |this| {
                         this.child(detail_row("Method", flash_method_label(board.flash), cx))
+                            .when_some(plan_detail.clone(), |this, detail| {
+                                // Settings Anode worked out rather than asked
+                                // for still have to be visible before the
+                                // write, not only in the confirmation.
+                                this.children(detail.into_iter().map(|line| {
+                                    let (label, value) = line
+                                        .split_once(": ")
+                                        .unwrap_or(("Setting", line.as_str()));
+                                    detail_row(label.to_string(), value.to_string(), cx)
+                                }))
+                            })
                             .when_some(board.flash.preparation(), |this, preparation| {
                                 this.child(
                                     div()
@@ -704,6 +803,13 @@ impl Workspace {
                                         .text_color(cx.theme().muted_foreground)
                                         .child(preparation),
                                 )
+                            })
+                            .when_some(running, |this, phase| {
+                                this.child(super::flash_progress(
+                                    "Working on the board",
+                                    phase.as_ref(),
+                                    cx,
+                                ))
                             })
                             .child(
                                 v_flex()
@@ -717,9 +823,9 @@ impl Workspace {
                                             .w_full()
                                             .justify_start()
                                             .disabled(!ready || board.mpy_variant.is_none())
-                                            .tooltip(match board.mpy_variant {
-                                                Some(variant) => {
-                                                    format!("Latest build of {variant}")
+                                            .tooltip(match &micropython_build {
+                                                Some(build) => {
+                                                    format!("Writes the latest {build} build")
                                                 }
                                                 None => {
                                                     "No MicroPython build is published for this board"
@@ -800,10 +906,12 @@ impl Workspace {
         let Some(board) = self.active_board() else {
             return;
         };
-        let port = self.selected_port.clone();
+        let Some(request) = self.flash_request(source.clone()) else {
+            return;
+        };
         let workspace = cx.weak_entity();
-        let title = format!("Flash {} to {}?", source.label(), board.name);
-        let detail = firmware_detail(board, &port);
+        let title = format!("Flash {} to {}?", request.image_label(), board.name);
+        let detail = flash_detail(&request);
         let preparation = board.flash.preparation();
 
         window.open_dialog(cx, move |dialog, _, _| {
@@ -815,10 +923,6 @@ impl Workspace {
                     v_flex()
                         .gap_2()
                         .children(detail.clone().into_iter().map(|line| div().child(line)))
-                        .child(
-                            "Everything currently on the board, including any files you saved \
-                             to it, is erased.",
-                        )
                         .when_some(preparation, |this, preparation| this.child(preparation)),
                 )
                 .footer(
@@ -983,13 +1087,26 @@ pub(crate) fn flash_method_label(method: FlashMethod) -> String {
     }
 }
 
-/// The lines that identify what a flash is about to touch.
-fn firmware_detail(board: &BoardDef, port: &str) -> Vec<String> {
+/// The lines that state what a flash is about to do, and what it costs.
+///
+/// Everything here is a setting Anode worked out rather than asked for, so
+/// the confirmation is the one place the user sees them — the chip that will
+/// be written, where the image lands, how fast, and that the board's own files
+/// go with it.
+pub(crate) fn flash_detail(request: &crate::device::FlashRequest) -> Vec<String> {
+    let board = request.board;
     let mut detail = vec![format!("Board: {} · {}", board.name, board.chip.label())];
-    if !port.is_empty() {
-        detail.push(format!("Port: {port}"));
+    if !request.port_path.is_empty() {
+        detail.push(format!("Port: {}", request.port_path));
     }
-    detail.push(format!("Method: {}", flash_method_label(board.flash)));
+    detail.push(format!("Image: {}", request.image_label()));
+    match request.plan() {
+        Some(plan) => detail.extend(plan.detail()),
+        None => detail.push(format!("Method: {}", flash_method_label(board.flash))),
+    }
+    detail.push(
+        "Everything currently on the board, including any files you saved to it, is erased.".into(),
+    );
     detail
 }
 
@@ -1048,17 +1165,53 @@ mod tests {
         );
     }
 
+    fn request(board_id: &str, port: &str) -> crate::device::FlashRequest {
+        crate::device::FlashRequest {
+            port_path: port.into(),
+            board: boards::board_by_id(board_id).unwrap(),
+            source: FirmwareSource::MicroPython,
+            report: None,
+            native_usb: false,
+        }
+    }
+
     #[test]
     fn the_confirmation_names_the_board_the_port_and_the_method() {
-        let board = boards::board_by_id("rpi-pico").unwrap();
-        let detail = firmware_detail(board, "/dev/cu.usbmodem1101");
+        let detail = flash_detail(&request("rpi-pico", "/dev/cu.usbmodem1101"));
         assert!(detail[0].contains("Raspberry Pi Pico"));
         assert!(detail
             .iter()
             .any(|line| line.contains("/dev/cu.usbmodem1101")));
         assert!(detail.iter().any(|line| line.contains("RPI-RP2")));
+        assert!(detail.iter().any(|line| line.contains("is erased")));
 
         // With no port, the line is left out rather than shown empty.
-        assert_eq!(firmware_detail(board, "").len(), 2);
+        let detail = flash_detail(&request("rpi-pico", ""));
+        assert!(!detail.iter().any(|line| line.starts_with("Port:")));
+    }
+
+    /// The settings the user never has to supply are the ones the
+    /// confirmation has to state, since this is where they become visible.
+    #[test]
+    fn an_esptool_confirmation_states_the_settings_anode_derived() {
+        let mut request = request("esp32-s3-generic", "/dev/cu.usbmodem1101");
+        request.report = Some(crate::esp::ChipReport {
+            chip: Some(Chip::Esp32S3),
+            psram: Some(crate::esp::Psram {
+                megabytes: 8,
+                octal: true,
+            }),
+            ..Default::default()
+        });
+        let detail = flash_detail(&request);
+        let text = detail.join("\n");
+        assert!(
+            text.contains("ESP32_GENERIC_S3-SPIRAM_OCT"),
+            "the PSRAM build is named: {text}"
+        );
+        assert!(text.contains("Chip: ESP32-S3"));
+        assert!(text.contains("0x0"), "the write offset is stated: {text}");
+        assert!(text.contains("baud"), "the speed is stated: {text}");
+        assert!(text.contains("erase"), "the erase is stated: {text}");
     }
 }

@@ -34,6 +34,18 @@ pub(crate) struct TerminalView {
 }
 
 impl TerminalView {
+    /// Queues a user-requested command in the visible interactive shell.
+    /// Used for provider-owned flows such as `codex login`; Anode does not
+    /// receive, parse, or persist credentials from that flow.
+    pub(crate) fn run_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        self.send(format!("{command}\n").into_bytes(), cx);
+    }
+
+    pub(crate) fn agent_output(&self, directory: &Path) -> Option<String> {
+        self.sessions
+            .get(directory)
+            .map(|session| crate::device::strip_ansi(&session.captured_output()))
+    }
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         let poll = cx.spawn(async move |this, cx| loop {
             cx.background_executor()
@@ -273,8 +285,9 @@ impl TerminalView {
                 // The caret is painted as its own quad beneath this line, so
                 // this cell suppresses its background rather than drawing one
                 // over it, and inverts its glyph to read against the caret.
-                let under_cursor = cursor
-                    .is_some_and(|cursor| cursor.focused && (cursor.row, cursor.column) == (row, col));
+                let under_cursor = cursor.is_some_and(|cursor| {
+                    cursor.focused && (cursor.row, cursor.column) == (row, col)
+                });
                 if under_cursor {
                     foreground = bg;
                 }
@@ -551,7 +564,11 @@ impl Render for TerminalView {
                                     window.paint_quad(if cursor.focused {
                                         gpui_kit::fill(caret, frame.caret)
                                     } else {
-                                        gpui_kit::outline(caret, frame.caret, gpui_kit::BorderStyle::Solid)
+                                        gpui_kit::outline(
+                                            caret,
+                                            frame.caret,
+                                            gpui_kit::BorderStyle::Solid,
+                                        )
                                     });
                                 }
                                 for (row, line) in frame.lines.iter().enumerate() {

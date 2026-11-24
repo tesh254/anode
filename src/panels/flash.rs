@@ -11,7 +11,7 @@ use super::Tool;
 use crate::boards::{self, BoardDef, FlashMethod, PortIdentity, Runtime};
 use crate::device::{self, DeviceEvent, FirmwareSource};
 use crate::hardware::{device_key, PortLeases, RecentBoard};
-use crate::views::{board_groups, flash_method_label, BoardItem};
+use crate::views::{board_groups, flash_detail, BoardItem};
 use crate::workspace_state::Workspace;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{h_flex, v_flex};
@@ -20,7 +20,7 @@ use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::dock::{BasePanel, Panel, PanelEvent, PanelInfo, PanelState};
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectGroup, SelectState};
 use gpui_kit::component::tag::Tag;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     div, App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
@@ -34,14 +34,16 @@ use std::time::Duration;
 /// What this panel is currently doing to its board.
 #[derive(Clone)]
 enum Job {
-    Firmware(FirmwareSource),
+    /// Boxed: a request carries the chip report, which is far larger than the
+    /// other variant and would otherwise set the size of every `Job`.
+    Firmware(Box<device::FlashRequest>),
     Upload,
 }
 
 impl Job {
     fn description(&self) -> String {
         match self {
-            Job::Firmware(source) => format!("Flashing {}", source.label()),
+            Job::Firmware(request) => format!("Flashing {}", request.image_label()),
             Job::Upload => "Uploading the project".into(),
         }
     }
@@ -61,8 +63,11 @@ pub(super) struct FlashPanel {
     board_id: Option<String>,
     picker: Entity<SelectState<SearchableVec<SelectGroup<BoardItem>>>>,
     running: Option<String>,
+    /// Where the running job has got to, read from its own output.
+    progress: Option<crate::esp::Progress>,
     log: Vec<String>,
     result: Option<Result<(), String>>,
+    recovery_context: Option<crate::recovery::RecoveryContext>,
     scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
     _job_task: Option<Task<()>>,
@@ -111,8 +116,10 @@ impl FlashPanel {
             board_id: selected,
             picker,
             running: None,
+            progress: None,
             log: Vec::new(),
             result: None,
+            recovery_context: None,
             scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
             _job_task: None,
@@ -181,9 +188,7 @@ impl FlashPanel {
             .cloned();
         let detected = port
             .as_ref()
-            .and_then(|port| {
-                boards::identify_board(Some(port), &workspace.settings.board_overrides).board
-            })
+            .and_then(|port| workspace.board_for_port(port).board)
             .or_else(|| {
                 saved
                     .as_ref()
@@ -235,42 +240,57 @@ impl FlashPanel {
 
     // -- Firmware -------------------------------------------------------------
 
+    /// Everything this write needs, including what the chip said about itself
+    /// when the workspace asked it.
+    fn request_for(&self, source: FirmwareSource, cx: &App) -> Option<device::FlashRequest> {
+        let board = self.board()?;
+        let port = self.port.clone()?;
+        let report = self
+            .owner
+            .upgrade()
+            .and_then(|owner| owner.read(cx).chip_report_for(&port).cloned());
+        Some(device::FlashRequest {
+            port_path: port.path.clone(),
+            board,
+            source,
+            report,
+            native_usb: crate::esp::is_native_usb(&port),
+        })
+    }
+
     fn confirm_firmware(
         &mut self,
         source: FirmwareSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (Some(board), Some(port)) = (self.board(), self.port.clone()) else {
-            return;
-        };
         if self.is_busy() {
             return;
         }
+        let (Some(board), Some(port)) = (self.board(), self.port.clone()) else {
+            return;
+        };
+        let Some(request) = self.request_for(source, cx) else {
+            return;
+        };
         // Capture what the user is confirming, so a board swap between the
         // dialog opening and the click cannot redirect the write.
         let target = (device_key(&port), port.path.clone(), board.id.to_string());
         let panel = cx.weak_entity();
-        let title = format!("Flash {} to {}?", source.label(), board.name);
-        let path = port.path.clone();
-        let method = flash_method_label(board.flash);
+        let title = format!("Flash {} to {}?", request.image_label(), board.name);
+        let detail = flash_detail(&request);
         let preparation = board.flash.preparation();
 
         window.open_dialog(cx, move |dialog, _, _| {
             let panel = panel.clone();
             let target = target.clone();
-            let source = source.clone();
+            let request = request.clone();
             dialog
                 .title(title.clone())
                 .child(
                     v_flex()
                         .gap_2()
-                        .child(format!("Port: {path}"))
-                        .child(format!("Method: {method}"))
-                        .child(
-                            "Everything currently on the board, including any files you saved \
-                             to it, is erased.",
-                        )
+                        .children(detail.clone().into_iter().map(|line| div().child(line)))
                         .when_some(preparation, |this, preparation| this.child(preparation)),
                 )
                 .footer(
@@ -283,13 +303,14 @@ impl FlashPanel {
                         .child(Button::new("confirm-flash").label("Flash").danger().on_click(
                             move |_, window, cx| {
                                 window.close_dialog(cx);
+                                let request = request.clone();
                                 _ = panel.update(cx, |this, cx| {
                                     let unchanged = this.port.as_ref().is_some_and(|port| {
                                         device_key(port) == target.0 && port.path == target.1
                                     }) && this.board_id.as_deref()
                                         == Some(target.2.as_str());
                                     if unchanged {
-                                        this.start(Job::Firmware(source.clone()), cx);
+                                        this.start(Job::Firmware(Box::new(request)), cx);
                                     } else {
                                         this.result = Some(Err(
                                             "The board on this port changed. Check the model and try again."
@@ -319,6 +340,11 @@ impl FlashPanel {
             return;
         };
         let runtime = self.runtime(cx);
+        self.recovery_context = Some(crate::recovery::RecoveryContext {
+            port: port.path.clone(),
+            runtime,
+            board: Some(board),
+        });
         let workspace = owner.read(cx);
         let files = workspace.project_files.clone();
         let project = workspace.project_path.clone();
@@ -362,6 +388,7 @@ impl FlashPanel {
         self.log.push(format!("{} · {}", board.name, port.path));
         self.result = None;
         self.running = Some(job.description());
+        self.progress = None;
 
         let spawned = std::thread::Builder::new()
             .name(format!("anode-device-{}", self.record.key))
@@ -410,11 +437,18 @@ impl FlashPanel {
         loop {
             match receiver.try_recv() {
                 Ok(JobEvent::Progress(message)) => {
+                    // A line that says nothing about where the write has got
+                    // to leaves the indicator where it was, rather than
+                    // flickering back to an unknown state.
+                    if let Some(progress) = crate::esp::progress_from_line(&message) {
+                        self.progress = Some(progress);
+                    }
                     self.log.push(message);
                     changed = true;
                 }
                 Ok(JobEvent::Finished(result)) => {
                     self.running = None;
+                    self.progress = None;
                     self.result = Some(result);
                     changed = true;
                     break;
@@ -422,6 +456,7 @@ impl FlashPanel {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.running = None;
+                    self.progress = None;
                     self.result = Some(Err("The device worker stopped.".into()));
                     changed = true;
                     break;
@@ -453,13 +488,13 @@ fn run_job(
     emit: &mut dyn FnMut(DeviceEvent),
 ) -> Result<(), String> {
     match job {
-        Job::Firmware(source) => {
-            let outcome = device::flash_firmware(port_path, board, source, emit);
-            if outcome.success {
-                Ok(())
-            } else {
-                Err(outcome.message())
+        Job::Firmware(request) => {
+            let outcome = device::flash_firmware(*request, emit);
+            if !outcome.success {
+                return Err(outcome.message());
             }
+            device::settle_after_flash(port_path, runtime, emit);
+            Ok(())
         }
         Job::Upload if runtime == Runtime::Arduino => {
             let project = project.ok_or("Open a sketch folder before uploading.")?;
@@ -501,6 +536,11 @@ impl BasePanel for FlashPanel {
     }
     fn closable(&self, _: &App) -> bool {
         !self.is_busy()
+    }
+    fn visible(&self, cx: &App) -> bool {
+        self.owner
+            .upgrade()
+            .is_none_or(|owner| owner.read(cx).is_board_panel_visible(&self.record.key))
     }
     fn dump(&self, _: &App) -> PanelState {
         let mut state = PanelState::new("anode.flash");
@@ -568,6 +608,25 @@ impl Render for FlashPanel {
             "Upload project"
         };
         let upload_supported = matches!(runtime, Runtime::Arduino | Runtime::MicroPython);
+        let workspace = self.owner.upgrade();
+        let (chip_detail, can_probe, probing) = match (&workspace, &self.port) {
+            (Some(workspace), Some(port)) => {
+                let workspace = workspace.read(cx);
+                (
+                    workspace
+                        .chip_report_for(port)
+                        .map(crate::esp::ChipReport::summary),
+                    workspace.chip_probe_is_useful(port) && !busy && !busy_elsewhere,
+                    matches!(
+                        workspace
+                            .chip_probes
+                            .get(&crate::hardware::device_key(port)),
+                        Some(crate::workspace_state::ChipProbe::Running)
+                    ),
+                )
+            }
+            _ => (None, false, false),
+        };
 
         v_flex()
             .size_full()
@@ -629,6 +688,36 @@ impl Render for FlashPanel {
                                 .text_xs()
                                 .text_color(cx.theme().warning)
                                 .child("This board is in use by the REPL or another panel."),
+                        )
+                    })
+                    .when_some(chip_detail, |this, detail| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(detail),
+                        )
+                    })
+                    .when(can_probe, |this| {
+                        this.child(
+                            Button::new("panel-identify")
+                                .label("Identify chip")
+                                .icon(IconName::Microchip)
+                                .outline()
+                                .small()
+                                .w_full()
+                                .justify_start()
+                                .loading(probing)
+                                .disabled(probing)
+                                .tooltip("Reset this board into its bootloader and read its chip")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let Some(port) = this.port.clone() else {
+                                        return;
+                                    };
+                                    _ = this.owner.update(cx, |workspace, cx| {
+                                        workspace.probe_chip_on(&port, true, cx);
+                                    });
+                                })),
                         )
                     })
                     .child(
@@ -737,13 +826,16 @@ impl Render for FlashPanel {
                             ),
                     )
                     .when_some(self.running.clone(), |this, running| {
-                        this.child(
-                            h_flex()
-                                .gap_1p5()
+                        this.child(crate::views::flash_progress(
+                            &running,
+                            self.progress.as_ref(),
+                            cx,
+                        ))
+                        .child(
+                            div()
                                 .text_xs()
-                                .text_color(cx.theme().info)
-                                .child(Icon::new(IconName::LoaderCircle).size_3())
-                                .child(format!("{running}… other boards stay usable")),
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Other boards stay usable while this runs."),
                         )
                     })
                     .when_some(self.result.as_ref(), |this, result| {
@@ -759,7 +851,42 @@ impl Render for FlashPanel {
                                     Err(error) => error.clone(),
                                 }),
                         )
-                    }),
+                    })
+                    .when_some(
+                        self.result
+                            .as_ref()
+                            .and_then(|result| result.as_ref().err())
+                            .and_then(|error| {
+                                crate::recovery::RecoveryKind::from_error(error)
+                                    .map(|kind| (kind, error.clone()))
+                            }),
+                        |this, (kind, detail)| {
+                            let owner = self.owner.clone();
+                            let context = self.recovery_context.clone().unwrap_or_else(|| {
+                                crate::recovery::RecoveryContext {
+                                    port: self.record.path.clone(),
+                                    runtime,
+                                    board,
+                                }
+                            });
+                            this.child(
+                                Button::new("panel-recovery-help")
+                                    .label("How to fix…")
+                                    .outline()
+                                    .small()
+                                    .on_click(move |_, window, cx| {
+                                        crate::views::open_recovery_dialog(
+                                            context.clone(),
+                                            kind,
+                                            Some(detail.clone()),
+                                            owner.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    }),
+                            )
+                        },
+                    ),
             )
             .child(
                 h_flex()

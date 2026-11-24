@@ -7,6 +7,7 @@
 
 use crate::boards::{self, BoardDef, BoardMatch, PortIdentity, Runtime};
 use crate::device::{self, DeviceEvent, FirmwareSource};
+use crate::esp;
 use crate::profiles::{self, CircuitPythonDrive, Confidence, ExecutionProfile, WorkspaceLayout};
 use crate::project::{self, Language, ProjectFile, ProjectKind};
 use crate::repl::{self, ReplConnection, ReplEvent};
@@ -26,6 +27,20 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 // Log entries
 // ---------------------------------------------------------------------------
+
+/// What asking a port's chip to identify itself produced.
+///
+/// A port is asked at most once per session unless the user asks again, so a
+/// board that is not Espressif costs one short handshake and is then left
+/// alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChipProbe {
+    Running,
+    Found(esp::ChipReport),
+    /// Nothing answered the Espressif bootloader on this port.
+    Silent,
+    Failed(String),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogKind {
@@ -63,6 +78,7 @@ pub struct LogEntry {
     /// each frame; copying two `String`s per line per frame is what made a
     /// running flash feel heavy.
     pub message: SharedString,
+    pub(crate) project: Option<PathBuf>,
 }
 
 /// Which way an Up/Down key moves through REPL history.
@@ -85,14 +101,35 @@ pub struct OpenTab {
 /// Events forwarded from background device work to the UI.
 enum BackgroundOutcome {
     Progress(String),
-    Finished(Result<(), String>),
+    Finished(Result<(), String>, Option<crate::recovery::RecoveryContext>),
 }
 
 // ---------------------------------------------------------------------------
 // Workspace
 // ---------------------------------------------------------------------------
 
+/// The full-window destination the user is looking at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Screen {
+    #[default]
+    Workspace,
+    Settings,
+}
+
+/// What each dock group shows when the window first opens.
+fn default_visible_panels(
+) -> std::collections::BTreeMap<crate::panels::ToolGroup, crate::panels::PanelChoice> {
+    use crate::panels::{PanelChoice, Tool};
+    [Tool::Files, Tool::Editor, Tool::Device, Tool::Output]
+        .into_iter()
+        .map(|tool| (tool.group(), PanelChoice::Tool(tool)))
+        .collect()
+}
+
 pub struct Workspace {
+    pub(crate) agents: crate::agent::AgentService,
+    pub(crate) _agent_poll: Option<Task<()>>,
+    pub(crate) _agent_watch: Option<Task<()>>,
     // Persisted settings (recent projects, last port, board overrides).
     pub settings: Settings,
 
@@ -126,6 +163,15 @@ pub struct Workspace {
     pub profile_manually_set: bool,
     pub circuit_python_drive: Option<CircuitPythonDrive>,
     pub connection_dropped: bool,
+    pub(crate) device_recovery: Option<crate::recovery::RecoveryIssue>,
+    /// What the chip on each physical board said about itself, keyed the same
+    /// way the board history is. A USB bridge can only name a family and often
+    /// names the wrong one, so this is what makes detection trustworthy.
+    pub chip_probes: std::collections::HashMap<String, ChipProbe>,
+    _chip_probe_task: Option<Task<()>>,
+    /// Set when a flash took the REPL's port away from it, so the REPL can be
+    /// put back once the board reboots.
+    repl_resumes_after_work: bool,
 
     // Toolchain availability, refreshed off the UI thread.
     pub tool_statuses: Vec<ToolStatus>,
@@ -159,7 +205,11 @@ pub struct Workspace {
 
     // Background device work: progress lines and completion.
     device_events: Option<Receiver<BackgroundOutcome>>,
+    device_work_project: Option<PathBuf>,
     pub device_busy: bool,
+    /// Where the running job has got to, read from its own output, so a long
+    /// write shows a phase and a percentage rather than only a spinner.
+    device_progress: Option<esp::Progress>,
     /// A heartbeat that repaints while a device job runs. Progress is drained
     /// in `render`, and the port poll now only repaints when discovery
     /// changed, so a long flash needs its own reason to draw frames.
@@ -168,6 +218,13 @@ pub struct Workspace {
     // Bottom panel.
     pub bottom_mode: BottomMode,
     pub(crate) workspace_mode: crate::panels::Tool,
+    /// Which full-window screen the user is on. Settings is a destination of
+    /// its own rather than a panel competing for dock space.
+    pub(crate) screen: Screen,
+    /// The one panel each dock group shows. Everything else in the group stays
+    /// hidden, which is what keeps the docks free of a tab strip.
+    pub(crate) visible_panels:
+        std::collections::BTreeMap<crate::panels::ToolGroup, crate::panels::PanelChoice>,
     pub(crate) panels: Option<crate::panels::PanelWorkspace>,
     pub(crate) port_leases: crate::hardware::PortLeases,
     pub(crate) layout_save_task: Option<Task<()>>,
@@ -224,7 +281,18 @@ impl Workspace {
                 }
             });
 
+        let mut agents = crate::agent::AgentService::default();
+        // Only a provider the user chose, and that is still installed, comes
+        // back after a restart. Anode never picks one on its own.
+        if let Some(id) = settings.agent_provider.clone() {
+            agents.restore_selection(&crate::agent::ProviderId::from(id));
+        }
+        agents.restore_chats(settings.agent_chats.clone());
+
         let mut this = Self {
+            agents,
+            _agent_poll: None,
+            _agent_watch: None,
             settings,
             project_path: None,
             project_name: String::new(),
@@ -246,6 +314,10 @@ impl Workspace {
             profile_manually_set: false,
             circuit_python_drive: None,
             connection_dropped: false,
+            device_recovery: None,
+            chip_probes: std::collections::HashMap::new(),
+            _chip_probe_task: None,
+            repl_resumes_after_work: false,
             tool_statuses: Vec::new(),
             tools_scanning: false,
             _tools_task: None,
@@ -264,10 +336,14 @@ impl Workspace {
             log_scroll: ScrollHandle::new(),
             next_log_id: 1,
             device_events: None,
+            device_work_project: None,
             device_busy: false,
+            device_progress: None,
             _device_poll: None,
             bottom_mode: BottomMode::Shell,
             workspace_mode: crate::panels::Tool::Editor,
+            screen: Screen::Workspace,
+            visible_panels: default_visible_panels(),
             panels: None,
             port_leases: Default::default(),
             layout_save_task: None,
@@ -279,6 +355,9 @@ impl Workspace {
             _subscriptions: vec![editor_subscription, repl_subscription],
         };
         this.start_port_polling(cx);
+        this.start_agent_poll(cx);
+        this._subscriptions
+            .push(cx.on_app_quit(|this, cx| this.agents.shutdown(cx)));
         this.refresh_tools(cx);
         this
     }
@@ -302,7 +381,7 @@ impl Workspace {
                         // redrew the whole window once a second forever,
                         // which is what made typing elsewhere feel heavy.
                         let changed = match ports {
-                            Ok(ports) => this.apply_port_snapshot(ports, drive),
+                            Ok(ports) => this.apply_port_snapshot(ports, drive, cx),
                             Err(_) => false,
                         };
                         if changed {
@@ -326,7 +405,7 @@ impl Workspace {
             _ = this.update(cx, |this, cx| {
                 match ports {
                     Ok(ports) => {
-                        this.apply_port_snapshot(ports, drive);
+                        this.apply_port_snapshot(ports, drive, cx);
                     }
                     Err(error) => {
                         this.add_log(LogKind::Error, format!("Could not scan USB ports: {error}"))
@@ -342,7 +421,12 @@ impl Workspace {
 
     /// Apply a discovery snapshot. Returns whether anything the UI draws
     /// changed, so a quiet tick costs no frame.
-    fn apply_port_snapshot(&mut self, ports: Vec<PortIdentity>, drive: CircuitPythonDrive) -> bool {
+    fn apply_port_snapshot(
+        &mut self,
+        ports: Vec<PortIdentity>,
+        drive: CircuitPythonDrive,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let ports_changed = ports != self.ports;
         let drive_changed = self.circuit_python_drive.as_ref() != Some(&drive);
         let before = self.detection_state();
@@ -379,6 +463,15 @@ impl Workspace {
         self.circuit_python_drive = Some(drive);
         self.auto_connect_if_needed();
         self.detect_board_for_selected_port();
+        // A bridge descriptor cannot name the chip, so ask the chip. Only
+        // a port that could still answer something new is asked, and only
+        // once.
+        if self
+            .selected_port_identity()
+            .is_some_and(|port| self.chip_probe_is_useful(&port))
+        {
+            self.probe_chip(false, cx);
+        }
         ports_changed || drive_changed || before != self.detection_state()
     }
 
@@ -471,7 +564,7 @@ impl Workspace {
     }
 
     fn detect_profiles_for(&self, port: &PortIdentity) -> Vec<ExecutionProfile> {
-        let board = boards::identify_board(Some(port), &self.settings.board_overrides);
+        let board = self.board_for_port(port);
         profiles::detect_profiles(port, &board, self.circuit_python_drive.as_ref())
     }
 
@@ -593,10 +686,171 @@ impl Workspace {
     }
 
     pub fn resolved_board(&self) -> BoardMatch {
-        boards::identify_board(
-            self.selected_port_identity().as_ref(),
-            &self.settings.board_overrides,
-        )
+        self.selected_port_identity()
+            .map(|port| self.board_for_port(&port))
+            .unwrap_or_default()
+    }
+
+    /// The board on a port: what the USB descriptor suggests, corrected by
+    /// what the chip itself reported when it was asked.
+    pub fn board_for_port(&self, port: &PortIdentity) -> BoardMatch {
+        let matched = boards::identify_board(Some(port), &self.settings.board_overrides);
+        match self.chip_probes.get(&crate::hardware::device_key(port)) {
+            Some(ChipProbe::Found(report)) => match report.chip {
+                Some(chip) => matched.refined_by_chip(chip),
+                None => matched,
+            },
+            _ => matched,
+        }
+    }
+
+    /// What the chip on a port reported, when it has been asked and answered.
+    pub fn chip_report_for(&self, port: &PortIdentity) -> Option<&esp::ChipReport> {
+        match self.chip_probes.get(&crate::hardware::device_key(port)) {
+            Some(ChipProbe::Found(report)) => Some(report),
+            _ => None,
+        }
+    }
+
+    /// How the probe of the selected port stands.
+    pub fn chip_probe(&self) -> Option<&ChipProbe> {
+        let port = self.selected_port_identity()?;
+        self.chip_probes.get(&crate::hardware::device_key(&port))
+    }
+
+    /// True while the selected port's chip is being asked what it is.
+    pub fn chip_probe_running(&self) -> bool {
+        matches!(self.chip_probe(), Some(ChipProbe::Running))
+    }
+
+    /// Whether asking this port's chip could tell us anything new.
+    ///
+    /// Worth asking when the descriptor left a real question: an Espressif
+    /// chip's own USB, a USB-UART bridge that fronts anything, or a board the
+    /// catalog resolved only to a chip family. A board the user pinned, or one
+    /// a product id identified outright, has nothing left to learn.
+    pub fn chip_probe_is_useful(&self, port: &PortIdentity) -> bool {
+        // Probing resets a real board. Tests run against whatever hardware
+        // happens to be plugged into the developer's machine, so they opt out
+        // the same way they redirect the config directory.
+        if std::env::var_os("ANODE_DISABLE_HARDWARE_PROBE").is_some() {
+            return false;
+        }
+        if toolchain::locate(Tool::Esptool) == toolchain::Location::Missing {
+            return false;
+        }
+        let matched = boards::identify_board(Some(port), &self.settings.board_overrides);
+        if matched.from_override || matched.exact {
+            return false;
+        }
+        esp::is_native_usb(port)
+            || boards::is_usb_uart_bridge(port)
+            || matched.board.is_some_and(|board| board.chip.is_espressif())
+    }
+
+    /// Ask the chip on the selected port to identify itself, once.
+    ///
+    /// `deliberate` separates the user pressing the button from the automatic
+    /// look on connect. The automatic one gives up after two handshakes, so a
+    /// port that fronts something other than an Espressif chip costs a couple
+    /// of seconds and is then left alone for the rest of the session.
+    pub fn probe_chip(&mut self, deliberate: bool, cx: &mut Context<Self>) {
+        let Some(port) = self.selected_port_identity() else {
+            return;
+        };
+        self.probe_chip_on(&port, deliberate, cx);
+    }
+
+    /// Ask the chip on a particular port, so a per-board panel can identify
+    /// its own board without first making it the workspace's selection.
+    pub fn probe_chip_on(&mut self, port: &PortIdentity, deliberate: bool, cx: &mut Context<Self>) {
+        let key = crate::hardware::device_key(port);
+        if self.device_busy || matches!(self.chip_probes.get(&key), Some(ChipProbe::Running)) {
+            return;
+        }
+        if !deliberate && self.chip_probes.contains_key(&key) {
+            return;
+        }
+        // Probing resets the chip into its bootloader, so it needs the port to
+        // itself exactly as a flash would.
+        let was_repl_connected = self.repl_connected && self.selected_port == port.path;
+        if was_repl_connected {
+            if !deliberate {
+                return;
+            }
+            self.repl_disconnect();
+        }
+        let lease = match self.port_leases.acquire(&key) {
+            Ok(lease) => lease,
+            Err(error) => {
+                if deliberate {
+                    self.add_log(LogKind::Warn, error);
+                }
+                return;
+            }
+        };
+        let path = port.path.clone();
+        let attempts = if deliberate { 7 } else { 2 };
+        self.chip_probes.insert(key.clone(), ChipProbe::Running);
+        if deliberate {
+            self.add_log(LogKind::Info, format!("Identifying the chip on {path}"));
+        }
+        self._chip_probe_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let _lease = lease;
+                    esp::probe(&path, attempts, &mut |_| {})
+                })
+                .await;
+            _ = this.update(cx, |this, cx| {
+                this.finish_chip_probe(key, result, deliberate, was_repl_connected, cx);
+            });
+        }));
+        cx.notify();
+    }
+
+    fn finish_chip_probe(
+        &mut self,
+        key: String,
+        result: Result<esp::ChipReport, esp::ProbeError>,
+        deliberate: bool,
+        resume_repl: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(report) => {
+                self.add_log(LogKind::Ok, format!("Detected {}", report.summary()));
+                let selected = self
+                    .selected_port_identity()
+                    .filter(|port| crate::hardware::device_key(port) == key);
+                self.chip_probes.insert(key, ChipProbe::Found(report));
+                // The chip decides which runtimes exist, so the profile set
+                // has to be rebuilt rather than merely relabelled.
+                if let Some(port) = selected {
+                    self.rebuild_profiles_for(&port);
+                }
+            }
+            Err(esp::ProbeError::NoAnswer(_)) => {
+                if deliberate {
+                    self.add_log(
+                        LogKind::Warn,
+                        "No Espressif chip answered on this port. Choose the board model by hand.",
+                    );
+                }
+                self.chip_probes.insert(key, ChipProbe::Silent);
+            }
+            Err(error) => {
+                if deliberate {
+                    self.add_log(LogKind::Warn, error.message());
+                }
+                self.chip_probes
+                    .insert(key, ChipProbe::Failed(error.message()));
+            }
+        }
+        if resume_repl {
+            self.repl_connect();
+        }
+        cx.notify();
     }
 
     /// The board the active profile targets, falling back to USB detection.
@@ -725,6 +979,7 @@ impl Workspace {
             kind,
             time: chrono::Local::now().format("%H:%M:%S").to_string().into(),
             message: message.into(),
+            project: self.project_path.clone(),
         });
         // Bound the log so a chatty flash session can't grow it forever.
         if self.log_entries.len() > 2000 {
@@ -736,6 +991,7 @@ impl Workspace {
 
     pub fn clear_log(&mut self) {
         self.log_entries.clear();
+        self.device_recovery = None;
     }
 
     pub fn set_log_filter(&mut self, filter: LogFilter) {
@@ -788,11 +1044,83 @@ impl Workspace {
         self.sync_editor_to_current_file(window, cx);
     }
 
+    // -- Screens and panel visibility ---------------------------------------
+
+    /// Open Settings as a full-window destination, re-checking the agents it
+    /// shows as it opens.
+    pub(crate) fn show_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.screen = Screen::Settings;
+        if let Some(screen) = self.settings_screen() {
+            screen.update(cx, |screen, cx| screen.show_providers(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Leave Settings and return to the workspace.
+    pub(crate) fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.screen = Screen::Workspace;
+        cx.notify();
+    }
+
+    /// Whether this tool is the one its dock region currently shows.
+    pub fn is_tool_visible(&self, tool: crate::panels::Tool) -> bool {
+        self.visible_panels
+            .get(&tool.group())
+            .is_some_and(|choice| *choice == crate::panels::PanelChoice::Tool(tool))
+    }
+
+    pub(crate) fn is_board_panel_visible(&self, key: &str) -> bool {
+        self.visible_panels
+            .get(&crate::panels::ToolGroup::Inspector)
+            .is_some_and(|choice| match choice {
+                crate::panels::PanelChoice::Board(visible) => visible == key,
+                _ => false,
+            })
+    }
+
+    /// Show one panel in its group, hiding whatever that group showed before.
+    pub(crate) fn select_panel(&mut self, choice: crate::panels::PanelChoice) {
+        self.visible_panels.insert(choice.group(), choice);
+    }
+
+    /// The display name of the agent chat is using, if the user chose one.
+    /// `None` means chat is still waiting for a choice.
+    pub fn selected_agent(&self) -> Option<String> {
+        self.agents
+            .selected_id()
+            .map(|id| self.agents.provider_name(id))
+    }
+
+    /// Every configured agent's display name, in the order Settings lists them.
+    pub fn configured_agents(&self) -> Vec<String> {
+        self.agents
+            .registry()
+            .all()
+            .iter()
+            .map(|profile| profile.name.clone())
+            .collect()
+    }
+
+    pub(crate) fn open_project_preserving_agent(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.open_project_inner(path, true, cx);
+    }
+
     /// Load a project without window access; the editor syncs on the next
     /// render via `needs_editor_sync`.
     fn open_project_from_drain(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.open_project_inner(path, false, cx);
+    }
+
+    fn open_project_inner(&mut self, path: PathBuf, preserve_agent: bool, cx: &mut Context<Self>) {
         match project::load_project(&path) {
             Ok(files) => {
+                if preserve_agent {
+                    if let Ok(canonical) = path.canonicalize() {
+                        self.agents.bind_preserving_active(canonical);
+                    }
+                } else {
+                    self.agents.bind(path.canonicalize().ok());
+                }
                 let name = path
                     .file_name()
                     .map(|name| name.to_string_lossy().to_string())
@@ -813,6 +1141,7 @@ impl Workspace {
                 self.project_name = name;
                 self.project_kind = kind;
                 self.project_files = files;
+                self.reset_agent_file_watch(cx);
                 self.open_tabs.clear();
                 self.active_tab = None;
                 // Open the file the project is about, not merely the first one
@@ -1090,7 +1419,7 @@ impl Workspace {
                     return;
                 };
                 self.add_log(LogKind::Info, format!("Compiling for {fqbn}"));
-                self.spawn_device_work(move |emit| {
+                self.spawn_build_work(move |emit| {
                     device::arduino_compile(&project_path, &fqbn, emit)
                 });
             }
@@ -1099,12 +1428,12 @@ impl Workspace {
                     return;
                 };
                 self.add_log(LogKind::Info, format!("Building with ESP-IDF for {target}"));
-                self.spawn_device_work(move |emit| device::idf_build(&project_path, &target, emit));
+                self.spawn_build_work(move |emit| device::idf_build(&project_path, &target, emit));
             }
             (Runtime::Native, _) => {
                 let environment = self.platformio_environments.first().cloned();
                 self.add_log(LogKind::Info, "Building with PlatformIO");
-                self.spawn_device_work(move |emit| {
+                self.spawn_build_work(move |emit| {
                     device::platformio_build(&project_path, environment.as_deref(), emit)
                 });
             }
@@ -1250,24 +1579,61 @@ impl Workspace {
         self.spawn_device_work(move |emit| device::stop_code(&port, emit));
     }
 
+    /// Where the running device job has got to, when its output said.
+    pub fn flash_phase(&self) -> Option<esp::Progress> {
+        self.device_progress.clone()
+    }
+
+    /// Everything a firmware write needs for the active board, including what
+    /// the chip itself reported. `None` when no board is resolved yet.
+    pub fn flash_request(&self, source: FirmwareSource) -> Option<device::FlashRequest> {
+        let board = self.active_board()?;
+        let port = self.selected_port_identity();
+        Some(device::FlashRequest {
+            port_path: self.selected_port.clone(),
+            board,
+            source,
+            report: port
+                .as_ref()
+                .and_then(|port| self.chip_report_for(port))
+                .cloned(),
+            native_usb: port.as_ref().is_some_and(esp::is_native_usb),
+        })
+    }
+
     /// Flash firmware onto the active board.
+    ///
+    /// The REPL holds the same serial port, so a flash takes it away and puts
+    /// it back rather than refusing until the user disconnects by hand.
     pub fn flash_firmware(&mut self, source: FirmwareSource) {
-        let Some(board) = self.active_board() else {
+        let Some(request) = self.flash_request(source) else {
             self.add_log(LogKind::Warn, "Select a board first");
             return;
         };
-        let port = self.selected_port.clone();
+        if self.repl_connected {
+            self.repl_disconnect();
+            self.repl_resumes_after_work = true;
+        }
+        let runtime = self.active_runtime();
+        let port = request.port_path.clone();
         self.add_log(
             LogKind::Info,
-            format!("Flashing {} · {}", board.name, source.label()),
+            format!(
+                "Flashing {} · {}",
+                request.board.name,
+                request.image_label()
+            ),
         );
         self.spawn_device_work(move |emit| {
-            let outcome = device::flash_firmware(&port, board, source, emit);
-            if outcome.success {
-                Ok(())
-            } else {
-                Err(outcome.message())
+            let outcome = device::flash_firmware(request, emit);
+            if !outcome.success {
+                return Err(outcome.message());
             }
+            // A board that writes correctly and then does not come back is
+            // still a failed flash from where the user sits, so say what
+            // happened next rather than stopping at "written".
+            device::settle_after_flash(&port, runtime, emit);
+            Ok(())
         });
     }
 
@@ -1341,6 +1707,22 @@ impl Workspace {
         &mut self,
         work: impl FnOnce(&mut dyn FnMut(DeviceEvent)) -> Result<(), String> + Send + 'static,
     ) {
+        self.spawn_work(true, work);
+    }
+
+    fn spawn_build_work(
+        &mut self,
+        work: impl FnOnce(&mut dyn FnMut(DeviceEvent)) -> Result<(), String> + Send + 'static,
+    ) {
+        // Compilation uses saved project files and must not take the REPL's serial lease.
+        self.spawn_work(false, work);
+    }
+
+    fn spawn_work(
+        &mut self,
+        uses_port: bool,
+        work: impl FnOnce(&mut dyn FnMut(DeviceEvent)) -> Result<(), String> + Send + 'static,
+    ) {
         if self.device_busy {
             self.add_log(LogKind::Warn, "Another device operation is still running");
             return;
@@ -1349,12 +1731,14 @@ impl Workspace {
             .selected_port_identity()
             .map(|port| crate::hardware::device_key(&port))
             .unwrap_or_else(|| self.selected_port.replace("/dev/tty.", "/dev/cu."));
-        let lease = if key.is_empty() {
+        let lease = if !uses_port || key.is_empty() {
             None
         } else {
             match self.port_leases.acquire(&key) {
                 Ok(lease) => Some(lease),
                 Err(error) => {
+                    self.device_recovery =
+                        crate::recovery::RecoveryIssue::from_error(self.recovery_context(), &error);
                     self.add_log(LogKind::Warn, error);
                     return;
                 }
@@ -1362,7 +1746,9 @@ impl Workspace {
         };
         let (sender, receiver) = std::sync::mpsc::channel::<BackgroundOutcome>();
         self.device_events = Some(receiver);
+        self.device_work_project = self.project_path.clone();
         self.device_busy = true;
+        let recovery_context = uses_port.then(|| self.recovery_context());
         std::thread::spawn(move || {
             let _lease = lease;
             let mut sink = |event: DeviceEvent| {
@@ -1370,7 +1756,7 @@ impl Workspace {
                 let _ = sender.send(BackgroundOutcome::Progress(message));
             };
             let result = work(&mut sink);
-            let _ = sender.send(BackgroundOutcome::Finished(result));
+            let _ = sender.send(BackgroundOutcome::Finished(result, recovery_context));
         });
     }
 
@@ -1398,16 +1784,47 @@ impl Workspace {
             };
             match event {
                 BackgroundOutcome::Progress(message) => {
+                    // A line that says nothing about where the work has got to
+                    // leaves the indicator where it was, rather than flickering
+                    // back to an unknown state.
+                    if let Some(progress) = esp::progress_from_line(&message) {
+                        self.device_progress = Some(progress);
+                    }
                     self.log_from_progress(&message);
+                    if let Some(entry) = self.log_entries.last_mut() {
+                        entry.project = self.device_work_project.clone();
+                    }
                     changed = true;
                 }
-                BackgroundOutcome::Finished(result) => {
+                BackgroundOutcome::Finished(result, context) => {
+                    self.agent_build_finished(result.clone());
+                    if let Some(context) = context {
+                        if let Err(error) = &result {
+                            self.device_recovery =
+                                crate::recovery::RecoveryIssue::from_error(context, error);
+                        } else if self.device_recovery.as_ref().is_some_and(|issue| {
+                            issue.context.port == context.port
+                                && issue.context.runtime == context.runtime
+                        }) {
+                            self.device_recovery = None;
+                        }
+                    }
+                    let first_error = self.next_log_id;
                     if let Err(error) = result {
                         for line in error.lines().filter(|line| !line.trim().is_empty()) {
                             self.add_log(LogKind::Error, line.to_string());
                         }
                     }
+                    for entry in self
+                        .log_entries
+                        .iter_mut()
+                        .filter(|entry| entry.id >= first_error)
+                    {
+                        entry.project = self.device_work_project.clone();
+                    }
+                    self.device_work_project = None;
                     self.device_busy = false;
+                    self.device_progress = None;
                     self.device_events = None;
                     finished = true;
                     changed = true;
@@ -1419,6 +1836,9 @@ impl Workspace {
             // An install or a core download changes what is available, and a
             // re-probe is cheap next to the job that just ran.
             self.refresh_tools(cx);
+            if std::mem::take(&mut self.repl_resumes_after_work) {
+                self.repl_connect();
+            }
         }
         if self.device_busy {
             if self._device_poll.is_none() {
@@ -1544,6 +1964,8 @@ impl Workspace {
         let lease = match self.port_leases.acquire(&key) {
             Ok(lease) => lease,
             Err(error) => {
+                self.device_recovery =
+                    crate::recovery::RecoveryIssue::from_error(self.recovery_context(), &error);
                 self.add_log(LogKind::Warn, error);
                 return;
             }
@@ -1559,6 +1981,8 @@ impl Workspace {
                 self.bottom_mode = BottomMode::Repl;
             }
             Err(error) => {
+                self.device_recovery =
+                    crate::recovery::RecoveryIssue::from_error(self.recovery_context(), &error);
                 self.repl_output
                     .push_str(&format!("[ERROR] Could not connect: {error}\n"));
                 self.add_log(LogKind::Error, format!("REPL: {error}"));
@@ -1637,6 +2061,11 @@ impl Workspace {
                     break;
                 }
                 Ok(ReplEvent::Error(error)) => {
+                    if let Some(issue) =
+                        crate::recovery::RecoveryIssue::from_error(self.recovery_context(), &error)
+                    {
+                        self.device_recovery = Some(issue);
+                    }
                     self.repl_output.push_str(&format!("\n[ERROR] {error}\n"));
                 }
                 Err(_) => break,

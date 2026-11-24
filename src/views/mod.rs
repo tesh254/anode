@@ -9,8 +9,10 @@
 
 mod console;
 mod device;
+mod recovery;
 
-pub(crate) use device::{board_groups, flash_method_label, BoardItem};
+pub(crate) use device::{board_groups, flash_detail, flash_method_label, BoardItem};
+pub(crate) use recovery::open_recovery_dialog;
 
 use crate::panels::Tool;
 use crate::project::TEMPLATES;
@@ -78,6 +80,45 @@ pub(crate) fn detail_row(
                 .child(label.into()),
         )
         .child(div().min_w_0().truncate().child(value.into()))
+}
+
+/// What a running flash is doing, and how far it has got.
+///
+/// A flash is minutes of work on hardware the user cannot see, so the phase
+/// is named in words and the bar is determinate wherever the flasher reports
+/// a percentage — state is never left to a spinner that could mean anything.
+pub(crate) fn flash_progress(
+    description: &str,
+    progress: Option<&crate::esp::Progress>,
+    cx: &gpui_kit::App,
+) -> gpui_kit::Div {
+    let phase = progress
+        .map(|progress| progress.phase.to_string())
+        .unwrap_or_else(|| description.to_string());
+    let percent = progress.and_then(|progress| progress.percent);
+    v_flex()
+        .gap_1p5()
+        .child(
+            h_flex()
+                .gap_2()
+                .justify_between()
+                .text_xs()
+                .child(div().min_w_0().truncate().child(phase.clone()))
+                .when_some(percent, |this, percent| {
+                    this.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{percent:.0}%")),
+                    )
+                }),
+        )
+        .child(
+            gpui_kit::component::progress::Progress::new("flash-progress")
+                .loading(percent.is_none())
+                .value(percent.unwrap_or_default())
+                .accessibility_label(phase),
+        )
 }
 
 /// The connection dot used in the status bar and every board row, so one
@@ -186,12 +227,17 @@ impl Render for Workspace {
         self.drain_background_events(window, cx);
         self.sync_pickers(window, cx);
 
+        if self.screen == crate::workspace_state::Screen::Settings {
+            return self.render_settings_screen(cx).into_any_element();
+        }
+
         v_flex()
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .text_sm()
             .child(self.render_header(cx))
+            .child(self.render_recovery_notice("workspace-recovery", cx))
             .when(
                 self.connection_dropped && !self.selected_port.is_empty(),
                 |this| this.child(self.render_connection_banner(cx)),
@@ -214,6 +260,7 @@ impl Render for Workspace {
                     ),
             )
             .child(self.render_status_bar(cx))
+            .into_any_element()
     }
 }
 
@@ -382,17 +429,26 @@ impl Workspace {
     // -- Activity bar ---------------------------------------------------------
 
     fn render_activity_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        // The bar is the switcher: one panel per dock region, so the icon shows
+        // which one is on screen and clicking it again hides that region.
+        let showing = |tool: Tool, this: &Self| this.is_tool_visible(tool);
         let entry = |id: &'static str,
                      icon: IconName,
                      label: &'static str,
                      tool: Tool,
+                     this: &Self,
                      cx: &mut Context<Self>| {
             Button::new(id)
                 .icon(icon)
                 .ghost()
+                .selected(showing(tool, this))
+                // It really is a toggle: clicking the shown panel hides it.
+                .toggled(showing(tool, this))
                 .accessibility_label(label)
                 .tooltip(label)
-                .on_click(cx.listener(move |this, _, window, cx| this.show_tool(tool, window, cx)))
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.toggle_tool(tool, window, cx)),
+                )
         };
 
         v_flex()
@@ -410,6 +466,7 @@ impl Workspace {
                 IconName::Files,
                 "Files",
                 Tool::Files,
+                self,
                 cx,
             ))
             .child(entry(
@@ -417,6 +474,7 @@ impl Workspace {
                 IconName::Usb,
                 "Boards",
                 Tool::Boards,
+                self,
                 cx,
             ))
             .child(entry(
@@ -424,6 +482,7 @@ impl Workspace {
                 IconName::Cpu,
                 "Board detail",
                 Tool::Device,
+                self,
                 cx,
             ))
             .child(entry(
@@ -431,6 +490,7 @@ impl Workspace {
                 IconName::Sparkles,
                 "Agent",
                 Tool::Agent,
+                self,
                 cx,
             ))
             .child(entry(
@@ -438,6 +498,7 @@ impl Workspace {
                 IconName::Boxes,
                 "Supported boards",
                 Tool::Catalog,
+                self,
                 cx,
             ))
             .child(div().h_2())
@@ -446,6 +507,7 @@ impl Workspace {
                 IconName::SquareTerminal,
                 "REPL",
                 Tool::Repl,
+                self,
                 cx,
             ))
             .child(entry(
@@ -453,6 +515,7 @@ impl Workspace {
                 IconName::Terminal,
                 "Terminal",
                 Tool::Terminal,
+                self,
                 cx,
             ))
             .child(entry(
@@ -460,6 +523,7 @@ impl Workspace {
                 IconName::ScanLine,
                 "Output",
                 Tool::Output,
+                self,
                 cx,
             ))
             .child(div().flex_1())
@@ -470,6 +534,68 @@ impl Workspace {
                     .accessibility_label("Reset layout")
                     .tooltip("Reset layout")
                     .on_click(cx.listener(|this, _, window, cx| this.reset_panels(window, cx))),
+            )
+            .child(
+                Button::new("activity-settings")
+                    .icon(IconName::Settings)
+                    .ghost()
+                    .accessibility_label("Settings")
+                    .tooltip("Settings")
+                    .on_click(cx.listener(|this, _, window, cx| this.show_settings(window, cx))),
+            )
+    }
+
+    // -- Settings screen ------------------------------------------------------
+
+    /// Settings replaces the workspace rather than competing with it for dock
+    /// space, so it brings its own navigation and its own way back.
+    fn render_settings_screen(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .text_sm()
+            .child(self.render_settings_header(cx))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .items_stretch()
+                    .when_some(self.settings_screen(), |this, screen| this.child(screen)),
+            )
+    }
+
+    fn render_settings_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        gpui_kit::component::TitleBar::new()
+            .h_12()
+            .bg(cx.theme().title_bar)
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_4()
+                    .px_3()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(render_logo(cx))
+                            .child(div().h_4().border_l_1().border_color(cx.theme().border))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Settings"),
+                            ),
+                    )
+                    .child(
+                        Button::new("settings-close")
+                            .label("Done")
+                            .outline()
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
+                    ),
             )
     }
 

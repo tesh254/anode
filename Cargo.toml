@@ -24,6 +24,28 @@ regex = "1"
 tempfile = "3"
 portable-pty = "0.9"
 vt100 = "0.18"
+agent-client-protocol = "=0.10.2"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "process", "io-util", "sync", "time", "macros"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+uuid = { version = "1", features = ["v4"] }
+libc = "0.2"
+futures = "0.3"
+
+[dev-dependencies]
+# `gpui-kit`'s test-support feature reaches proptest, whose `rand_xorshift`
+# requirement currently only has a prerelease; Cargo needs it named explicitly.
+rand_xorshift = "0.5.0-rc.0"
+# Same source and version as the normal dependency, plus the headless window
+# helpers used by `tests/ui.rs`.
+gpui-kit = { version = "0.9.1", features = [
+    "tree-sitter-python",
+    "tree-sitter-c",
+    "tree-sitter-cpp",
+    "tree-sitter-cmake",
+    "tree-sitter-toml",
+    "test-support",
+] }
 
 [dependencies.serialport]
 version = "4"

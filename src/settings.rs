@@ -24,6 +24,14 @@ pub struct Settings {
     pub fqbn_overrides: std::collections::HashMap<String, String>,
     pub recent_boards: Vec<crate::hardware::RecentBoard>,
     pub panel_layout: Option<gpui_kit::component::dock::DockAreaState>,
+    /// Local agent transcripts. ACP credentials, sessions, grants, and tool
+    /// output handles stay with each provider and are never written here.
+    pub agent_chats: Vec<crate::agent::SavedChat>,
+    /// The provider the user last chose. Restored only while it is still
+    /// configured and installed; Anode never picks one on its own.
+    pub(crate) agent_provider: Option<String>,
+    /// Start the chosen agent when a project opens.
+    pub agent_auto_connect: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,6 +65,9 @@ impl Default for Settings {
             fqbn_overrides: Default::default(),
             recent_boards: Vec::new(),
             panel_layout: None,
+            agent_chats: Vec::new(),
+            agent_provider: None,
+            agent_auto_connect: true,
         }
     }
 }

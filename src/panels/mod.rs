@@ -3,6 +3,7 @@
 mod agent;
 mod catalog;
 mod flash;
+mod settings;
 
 use crate::hardware::{PortLeases, RecentBoard};
 use crate::workspace_state::Workspace;
@@ -21,13 +22,14 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
     Subscription, WeakEntity, Window,
 };
+use settings::SettingsScreen;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Tool {
+pub enum Tool {
     Files,
     Boards,
     Catalog,
@@ -37,6 +39,37 @@ pub(crate) enum Tool {
     Repl,
     Device,
     Agent,
+}
+
+/// The region of the window a panel lives in. One panel per group is shown at
+/// a time, chosen from the activity bar, so the docks carry no tab strip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ToolGroup {
+    /// The left dock: project navigation.
+    Navigator,
+    /// The center: the editor.
+    Workbench,
+    /// The right dock: the board, the agent, and board tasks.
+    Inspector,
+    /// The bottom dock: output, REPL and terminal.
+    Console,
+}
+
+/// Which panel a group is currently showing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PanelChoice {
+    Tool(Tool),
+    /// A board task panel, keyed by its [`RecentBoard`] key.
+    Board(String),
+}
+
+impl PanelChoice {
+    pub(crate) fn group(&self) -> ToolGroup {
+        match self {
+            Self::Tool(tool) => tool.group(),
+            Self::Board(_) => ToolGroup::Inspector,
+        }
+    }
 }
 
 impl Tool {
@@ -52,7 +85,7 @@ impl Tool {
         Tool::Device,
     ];
 
-    pub(crate) fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Files => "Files",
             Self::Boards => "Boards",
@@ -63,6 +96,15 @@ impl Tool {
             Self::Repl => "REPL",
             Self::Device => "Board",
             Self::Agent => "Agent",
+        }
+    }
+
+    pub fn group(self) -> ToolGroup {
+        match self {
+            Self::Files | Self::Boards | Self::Catalog => ToolGroup::Navigator,
+            Self::Editor => ToolGroup::Workbench,
+            Self::Output | Self::Repl | Self::Terminal => ToolGroup::Console,
+            Self::Device | Self::Agent => ToolGroup::Inspector,
         }
     }
 
@@ -81,17 +123,17 @@ impl Tool {
     }
 
     fn placement(self) -> DockPlacement {
-        match self {
-            Self::Files | Self::Boards | Self::Catalog => DockPlacement::Left,
-            Self::Editor => DockPlacement::Center,
-            Self::Output | Self::Repl | Self::Terminal => DockPlacement::Bottom,
-            Self::Device | Self::Agent => DockPlacement::Right,
+        match self.group() {
+            ToolGroup::Navigator => DockPlacement::Left,
+            ToolGroup::Workbench => DockPlacement::Center,
+            ToolGroup::Console => DockPlacement::Bottom,
+            ToolGroup::Inspector => DockPlacement::Right,
         }
     }
 
     /// True for the tools that share the bottom console tab group.
     fn is_console(self) -> bool {
-        matches!(self, Self::Terminal | Self::Output | Self::Repl)
+        self.group() == ToolGroup::Console
     }
 }
 
@@ -136,6 +178,13 @@ impl BasePanel for ToolPanel {
     fn closable(&self, _: &App) -> bool {
         self.tool != Tool::Editor
     }
+    /// One panel per group is shown at a time, chosen from the activity bar.
+    /// Hiding the rest is what leaves the dock without a tab strip.
+    fn visible(&self, cx: &App) -> bool {
+        self.owner
+            .upgrade()
+            .is_none_or(|owner| owner.read(cx).is_tool_visible(self.tool))
+    }
 }
 
 impl Panel for ToolPanel {
@@ -179,7 +228,7 @@ impl Render for ToolPanel {
                 Tool::Device => workspace
                     .render_device_inspector(window, cx)
                     .into_any_element(),
-                // Rendered by `CatalogPanel`, which owns its own state.
+                // Rendered by panels that own their own state.
                 Tool::Catalog | Tool::Agent => div().into_any_element(),
             })
             .unwrap_or_else(|_| div().into_any_element());
@@ -201,6 +250,7 @@ pub(crate) struct PanelWorkspace {
     tools: BTreeMap<Tool, Entity<ToolPanel>>,
     catalog: Entity<CatalogPanel>,
     agent: Entity<AgentPanel>,
+    settings: Entity<SettingsScreen>,
     flashes: FlashPanels,
     owner: WeakEntity<Workspace>,
     leases: PortLeases,
@@ -239,6 +289,10 @@ impl PanelWorkspace {
         register_panel(cx, Tool::Agent.registry_name(), move |_, _, _| {
             panel_handle(restored_agent.clone())
         });
+
+        // Settings is a full-window destination, not a dock panel, so it is
+        // built here but never registered with the dock.
+        let settings = cx.new(|cx| SettingsScreen::new(owner.clone(), window, cx));
 
         let flashes: FlashPanels = Rc::default();
         let restored_flashes = flashes.clone();
@@ -280,6 +334,7 @@ impl PanelWorkspace {
             tools,
             catalog,
             agent,
+            settings,
             flashes,
             owner,
             leases,
@@ -439,6 +494,58 @@ impl PanelWorkspace {
         });
     }
 
+    /// Whether the dock a tool currently lives in is open.
+    fn is_dock_open(&self, tool: Tool, cx: &App) -> bool {
+        let Some(id) = self.panel_id(tool, cx) else {
+            return false;
+        };
+        let dock = self.dock.read(cx);
+        [
+            DockPlacement::Left,
+            DockPlacement::Right,
+            DockPlacement::Bottom,
+        ]
+        .into_iter()
+        .find(|placement| {
+            dock.layout(*placement)
+                .is_some_and(|tree| tree.find_panel_node(id).is_some())
+        })
+        .is_none_or(|placement| dock.is_dock_open(placement))
+    }
+
+    /// Collapse the dock a tool lives in. The center area has no dock to close.
+    fn close_dock(&self, tool: Tool, window: &mut Window, cx: &mut App) {
+        let Some(id) = self.panel_id(tool, cx) else {
+            return;
+        };
+        self.dock.update(cx, |dock, cx| {
+            let placement = [
+                DockPlacement::Left,
+                DockPlacement::Right,
+                DockPlacement::Bottom,
+            ]
+            .into_iter()
+            .find(|placement| {
+                dock.layout(*placement)
+                    .is_some_and(|tree| tree.find_panel_node(id).is_some())
+            });
+            if let Some(placement) = placement {
+                if dock.is_dock_open(placement) {
+                    dock.toggle_dock(placement, window, cx);
+                }
+            }
+        });
+    }
+
+    fn panel_id(&self, tool: Tool, cx: &App) -> Option<PanelId> {
+        let _ = cx;
+        Some(match tool {
+            Tool::Agent => PanelId::from(self.agent.entity_id()),
+            Tool::Catalog => PanelId::from(self.catalog.entity_id()),
+            other => PanelId::from(self.tools.get(&other)?.entity_id()),
+        })
+    }
+
     /// The dock node that already holds a console tool, if any.
     fn console_node(&self, dock: &DockArea) -> Option<NodeId> {
         Tool::SHARED
@@ -526,27 +633,63 @@ impl Workspace {
         if matches!(tool, Tool::Editor | Tool::Repl | Tool::Device) {
             self.workspace_mode = tool;
         }
+        self.screen = crate::workspace_state::Screen::Workspace;
+        self.select_panel(PanelChoice::Tool(tool));
         if let Some(panels) = &self.panels {
             panels.open_tool(tool, window, cx);
         }
         cx.notify();
     }
 
+    /// Hide the dock a tool lives in when it is already the one on screen, so
+    /// the activity bar reads as a toggle.
+    pub(crate) fn toggle_tool(&mut self, tool: Tool, window: &mut Window, cx: &mut Context<Self>) {
+        let showing = self.screen == crate::workspace_state::Screen::Workspace
+            && self.is_tool_visible(tool)
+            && self.is_dock_open(tool, cx);
+        if showing && tool != Tool::Editor {
+            if let Some(panels) = &self.panels {
+                panels.close_dock(tool, window, cx);
+            }
+            cx.notify();
+            return;
+        }
+        self.show_tool(tool, window, cx);
+    }
+
+    fn is_dock_open(&self, tool: Tool, cx: &App) -> bool {
+        self.panels
+            .as_ref()
+            .is_some_and(|panels| panels.is_dock_open(tool, cx))
+    }
+
     pub(crate) fn open_board_panel(
-        &self,
+        &mut self,
         record: RecentBoard,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.select_panel(PanelChoice::Board(record.key.clone()));
         if let Some(panels) = &self.panels {
             panels.open_flash(record, window, cx);
         }
+        cx.notify();
+    }
+
+    /// The Settings screen, built with the panels so it shares their lifetime.
+    pub(crate) fn settings_screen(&self) -> Option<Entity<SettingsScreen>> {
+        self.panels.as_ref().map(|panels| panels.settings.clone())
     }
 
     pub(crate) fn reset_panels(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(panels) = &self.panels {
             panels.reset_layout(window, cx);
         }
+    }
+
+    pub(crate) fn persist_agent_chats(&mut self) {
+        self.settings.agent_chats = self.agents.snapshot_chats();
+        self.settings.save();
     }
 }
 

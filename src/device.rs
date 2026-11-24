@@ -361,6 +361,15 @@ impl FlashOutcome {
         self
     }
 
+    /// A failure already read for what it means.
+    fn from_diagnosis(diagnosis: crate::esp::Diagnosis) -> Self {
+        Self {
+            success: false,
+            error: Some(diagnosis.what),
+            hint: diagnosis.next,
+        }
+    }
+
     /// The single message to show for a failure.
     pub fn message(self) -> String {
         let error = self.error.unwrap_or_else(|| "Flashing failed".into());
@@ -395,13 +404,65 @@ impl FirmwareSource {
     }
 }
 
+/// One firmware write, with everything the board already told us about
+/// itself.
+///
+/// The chip report and the connection kind are what let the write choose its
+/// own chip argument, offset, baud rate and firmware variant instead of
+/// asking, so they travel with the request rather than being looked up again
+/// on the worker thread.
+#[derive(Clone)]
+pub struct FlashRequest {
+    pub port_path: String,
+    pub board: &'static BoardDef,
+    pub source: FirmwareSource,
+    /// What `esptool` reported about the chip, when it was asked.
+    pub report: Option<crate::esp::ChipReport>,
+    /// True when the port is the chip's own USB peripheral rather than a
+    /// USB-UART bridge in front of it.
+    pub native_usb: bool,
+}
+
+impl FlashRequest {
+    /// The settings this write will use, for the confirmation that precedes
+    /// it. `None` for a board that is not written over serial by esptool.
+    pub fn plan(&self) -> Option<crate::esp::FlashPlan> {
+        (self.board.flash == FlashMethod::Esptool)
+            .then(|| crate::esp::FlashPlan::full_image(self.chip(), self.native_usb))
+    }
+
+    /// The chip to write, preferring what the silicon said over what the
+    /// catalog entry assumes.
+    fn chip(&self) -> Chip {
+        self.report
+            .as_ref()
+            .and_then(|report| report.chip)
+            .filter(|chip| chip.is_espressif())
+            .unwrap_or(self.board.chip)
+    }
+
+    /// The firmware image this write will fetch, named as the user sees it.
+    pub fn image_label(&self) -> String {
+        match &self.source {
+            FirmwareSource::MicroPython => {
+                crate::esp::micropython_variant(self.board, self.report.as_ref())
+                    .unwrap_or_else(|| "MicroPython".into())
+            }
+            other => other.label(),
+        }
+    }
+}
+
 /// Download (or take) a firmware image and write it to the board.
-pub fn flash_firmware(
-    port_path: &str,
-    board: &BoardDef,
-    source: FirmwareSource,
-    emit: &mut dyn FnMut(DeviceEvent),
-) -> FlashOutcome {
+pub fn flash_firmware(request: FlashRequest, emit: &mut dyn FnMut(DeviceEvent)) -> FlashOutcome {
+    let FlashRequest {
+        ref port_path,
+        board,
+        ref source,
+        ref report,
+        ..
+    } = request;
+    let port_path = port_path.as_str();
     progress!(
         emit,
         "Flashing {} on {} · {}",
@@ -428,14 +489,16 @@ pub fn flash_firmware(
             path
         }
         FirmwareSource::MicroPython => {
-            let Some(variant) = board.mpy_variant else {
+            // The chip's own report decides the build: an ESP32-S3 with octal
+            // PSRAM wants a different image from the same board without it.
+            let Some(variant) = crate::esp::micropython_variant(board, report.as_ref()) else {
                 return FlashOutcome::failed(format!(
                     "No MicroPython build is published for {}.",
                     board.name
                 ))
                 .with_hint("Pick a different firmware source, or flash an image from disk.");
             };
-            match download_micropython(variant, board.flash.firmware_extension(), emit) {
+            match download_micropython(&variant, board.flash.firmware_extension(), emit) {
                 Ok(path) => {
                     downloaded = path;
                     downloaded.as_ref()
@@ -461,18 +524,24 @@ pub fn flash_firmware(
         }
     };
 
-    write_firmware(port_path, board, firmware, emit)
+    write_firmware(&request, firmware, emit)
 }
 
 /// Write an image that is already on disk, using the board's flash method.
 fn write_firmware(
-    port_path: &str,
-    board: &BoardDef,
+    request: &FlashRequest,
     firmware: &Path,
     emit: &mut dyn FnMut(DeviceEvent),
 ) -> FlashOutcome {
+    let board = request.board;
+    let port_path = request.port_path.as_str();
     match board.flash {
-        FlashMethod::Esptool => write_with_esptool(port_path, board.chip, firmware, emit),
+        FlashMethod::Esptool => write_with_esptool(
+            port_path,
+            crate::esp::FlashPlan::full_image(request.chip(), request.native_usb),
+            firmware,
+            emit,
+        ),
         FlashMethod::MassStorage { volume, marker } => {
             copy_to_boot_volume(volume, marker, firmware, emit)
         }
@@ -483,52 +552,111 @@ fn write_firmware(
     }
 }
 
+/// Write a full image with `esptool`, using the settings the chip and the
+/// connection already decided.
+///
+/// A marginal link — a long cable, a hub, a bridge that cannot hold the
+/// faster rate — is the one failure worth answering without the user: the
+/// write is retried once at the conservative rate before anything is
+/// reported, because "try a slower speed" is advice Anode can simply follow.
 fn write_with_esptool(
     port_path: &str,
-    chip: Chip,
+    plan: crate::esp::FlashPlan,
     firmware: &Path,
     emit: &mut dyn FnMut(DeviceEvent),
 ) -> FlashOutcome {
-    let Some(mut command) = toolchain::command_for(Tool::Esptool) else {
-        return FlashOutcome::failed(missing_tool(Tool::Esptool));
-    };
-    let offset = chip.flash_offset();
     progress!(
         emit,
-        "Writing {} at {offset} with esptool…",
-        firmware.display()
+        "Writing {} to the {} at {} ({} baud){}",
+        firmware.display(),
+        plan.chip.label(),
+        plan.offset,
+        plan.baud,
+        if plan.erase_first {
+            ", erasing first"
+        } else {
+            ""
+        }
     );
+
+    match esptool_write(port_path, &plan, firmware, emit) {
+        Ok(()) => {
+            progress!(emit, "[OK] Firmware written and verified");
+            FlashOutcome::ok()
+        }
+        Err(diagnosis) if diagnosis.kind == crate::esp::FailureKind::LinkUnstable => {
+            let slower = plan.slowed();
+            progress!(
+                emit,
+                "The link dropped packets at {} baud. Retrying at {}…",
+                plan.baud,
+                slower.baud
+            );
+            match esptool_write(port_path, &slower, firmware, emit) {
+                Ok(()) => {
+                    progress!(
+                        emit,
+                        "[OK] Firmware written and verified at {} baud",
+                        slower.baud
+                    );
+                    FlashOutcome::ok()
+                }
+                Err(diagnosis) => FlashOutcome::from_diagnosis(diagnosis),
+            }
+        }
+        Err(diagnosis) => FlashOutcome::from_diagnosis(diagnosis),
+    }
+}
+
+/// One `esptool write_flash` run.
+fn esptool_write(
+    port_path: &str,
+    plan: &crate::esp::FlashPlan,
+    firmware: &Path,
+    emit: &mut dyn FnMut(DeviceEvent),
+) -> Result<(), crate::esp::Diagnosis> {
+    let Some(mut command) = toolchain::command_for(Tool::Esptool) else {
+        return Err(crate::esp::Diagnosis {
+            kind: crate::esp::FailureKind::Other,
+            what: missing_tool(Tool::Esptool),
+            next: None,
+        });
+    };
+    let syntax = crate::esp::syntax();
+    let baud = plan.baud.to_string();
     command.args([
         "--port",
         port_path,
         "--baud",
-        "460800",
+        &baud,
+        // Naming the chip is what turns a mismatched board model into a
+        // refusal with a clear message instead of a half-written flash.
+        "--chip",
+        plan.chip.esptool_name(),
         "--before",
-        "default_reset",
+        &syntax.spell("default_reset"),
         "--after",
-        "hard_reset",
-        "write_flash",
+        &syntax.spell("hard_reset"),
+        &syntax.spell("write_flash"),
         "-z",
-        offset,
-        firmware.to_string_lossy().as_ref(),
     ]);
+    if plan.erase_first {
+        // The image replaces the bootloader, the partition table and the
+        // application, but not a filesystem the previous firmware left
+        // behind — and a stale filesystem is the usual reason a freshly
+        // flashed board does not come back.
+        command.arg("--erase-all");
+    }
+    command.args([plan.offset, firmware.to_string_lossy().as_ref()]);
 
     match run_streaming(&mut command, emit) {
-        Ok(outcome) if outcome.status.success() => {
-            progress!(emit, "[OK] Firmware written");
-            FlashOutcome::ok()
-        }
-        Ok(outcome) => {
-            let connection_failed = outcome.tail.contains("No serial data received")
-                || outcome.tail.contains("Failed to connect")
-                || outcome.tail.contains("chip stopped responding");
-            FlashOutcome::failed(outcome.tail.trim().to_string()).with_hint(if connection_failed {
-                "Hold the BOOT button while the board connects, then try again."
-            } else {
-                "Check that no REPL or serial monitor is holding the port."
-            })
-        }
-        Err(error) => FlashOutcome::failed(error),
+        Ok(outcome) if outcome.status.success() => Ok(()),
+        Ok(outcome) => Err(crate::esp::diagnose(&outcome.tail, Some(plan.chip))),
+        Err(error) => Err(crate::esp::Diagnosis {
+            kind: crate::esp::FailureKind::Other,
+            what: error,
+            next: None,
+        }),
     }
 }
 
@@ -691,6 +819,110 @@ fn write_with_teensy_loader(
 }
 
 // ---------------------------------------------------------------------------
+// After the write
+// ---------------------------------------------------------------------------
+
+/// How long to wait for a board to come back after a reset. A chip on its own
+/// USB peripheral drops off the bus while it reboots and re-enumerates, which
+/// takes a couple of seconds; behind a bridge the port never went away.
+const REAPPEAR_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Wait for the board to come back and say whether the new firmware is
+/// actually running.
+///
+/// "Firmware written" is the flasher's result, not the user's. The question
+/// they asked was whether the board works now, and the honest answer needs the
+/// board to answer for itself.
+pub fn settle_after_flash(
+    port_path: &str,
+    runtime: Runtime,
+    emit: &mut dyn FnMut(DeviceEvent),
+) -> bool {
+    progress!(emit, "Waiting for the board to restart…");
+    if !wait_for_port(port_path, REAPPEAR_TIMEOUT) {
+        progress!(
+            emit,
+            "The board has not come back on {port_path} yet. If it stays away, unplug it and \
+             connect it again."
+        );
+        return false;
+    }
+    if runtime != Runtime::MicroPython {
+        progress!(emit, "[OK] {port_path} is back");
+        return true;
+    }
+    if toolchain::locate(Tool::Mpremote) == toolchain::Location::Missing {
+        progress!(
+            emit,
+            "[OK] {port_path} is back. Install mpremote to have Anode confirm the firmware booted."
+        );
+        return true;
+    }
+    match running_firmware(port_path) {
+        Some(description) => {
+            progress!(emit, "[OK] {description} is running on {port_path}");
+            true
+        }
+        None => {
+            progress!(
+                emit,
+                "{port_path} is back, but it did not answer a REPL prompt. Tap RESET, then open \
+                 the REPL to check."
+            );
+            false
+        }
+    }
+}
+
+/// Wait for a serial device node to exist again, polling rather than assuming.
+fn wait_for_port(port_path: &str, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if Path::new(port_path).exists() {
+            // The node appears slightly before the CDC endpoint is ready to
+            // talk, so give the board the moment it needs.
+            std::thread::sleep(Duration::from_millis(600));
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Ask the board which firmware it is running, in its own words.
+pub fn running_firmware(port_path: &str) -> Option<String> {
+    // Two tries: the first REPL attempt often lands while the board is still
+    // finishing its boot.
+    for attempt in 0..2 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(1200));
+        }
+        let result = run_mpremote(
+            port_path,
+            &[
+                "exec",
+                "import sys; v = sys.implementation.version; \
+                 print(sys.implementation.name, '.'.join(str(part) for part in v[:3]))",
+            ],
+        );
+        if !result.success {
+            continue;
+        }
+        let answer = result.stdout.trim();
+        let (name, version) = answer.split_once(char::is_whitespace)?;
+        let label = match name {
+            "micropython" => "MicroPython",
+            "circuitpython" => "CircuitPython",
+            other => other,
+        };
+        return Some(format!("{label} {version}"));
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Firmware downloads
 // ---------------------------------------------------------------------------
 
@@ -732,25 +964,44 @@ fn page_links(body: &str) -> Vec<&str> {
 }
 
 /// Find the firmware link on a micropython.org download page.
+///
+/// One page lists every build in a variant family, so `ESP32_GENERIC_S3` and
+/// `ESP32_GENERIC_S3-SPIRAM_OCT` both appear on the `ESP32_GENERIC_S3` page.
+/// Matching the file name against the exact variant is what keeps a PSRAM
+/// board from being handed the plain build, or the other way round.
 fn micropython_url(variant: &str, extension: &str) -> Result<String, String> {
-    let page = format!("https://micropython.org/download/{variant}/");
-    let body = String::from_utf8_lossy(&http_get(&page)?).to_string();
+    let page = crate::esp::micropython_download_page(variant);
+    let body = String::from_utf8_lossy(&http_get(&format!(
+        "https://micropython.org/download/{page}/"
+    ))?)
+    .to_string();
     let links: Vec<&str> = page_links(&body)
         .into_iter()
         .filter(|link| link.starts_with("/resources/firmware/"))
         .collect();
-    // `.app-bin` is the OTA image, not the full flash image.
-    let pick = links
-        .iter()
-        .find(|link| link.ends_with(extension) && !link.ends_with(".app-bin"))
-        .or_else(|| links.first());
-    match pick {
+    match pick_micropython_link(&links, variant, extension) {
         Some(link) => Ok(format!("https://micropython.org{link}")),
         None => Err(format!(
             "micropython.org lists no {extension} build for {variant}. Pick another board model, \
              or flash an image from disk."
         )),
     }
+}
+
+/// Choose the newest full image for exactly `variant`. The page is ordered
+/// newest first, so the first match is the current release.
+fn pick_micropython_link<'a>(links: &[&'a str], variant: &str, extension: &str) -> Option<&'a str> {
+    let prefix = format!("{variant}-");
+    links
+        .iter()
+        .copied()
+        // `.app-bin` is the OTA image, not the full flash image.
+        .filter(|link| link.ends_with(extension) && !link.ends_with(".app-bin"))
+        .find(|link| {
+            link.rsplit('/')
+                .next()
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
 }
 
 /// Find the firmware link on a circuitpython.org board page.

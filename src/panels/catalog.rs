@@ -227,6 +227,11 @@ impl BasePanel for CatalogPanel {
     fn panel_name(&self) -> &'static str {
         super::Tool::Catalog.registry_name()
     }
+    fn visible(&self, cx: &App) -> bool {
+        self.owner
+            .upgrade()
+            .is_none_or(|owner| owner.read(cx).is_tool_visible(super::Tool::Catalog))
+    }
 }
 
 impl Panel for CatalogPanel {

@@ -248,6 +248,20 @@ fn extra_search_dirs() -> Vec<PathBuf> {
     ];
     if let Some(home) = dirs::home_dir() {
         dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(".opencode/bin"));
+        dirs.push(home.join(".codex/bin"));
+        dirs.push(home.join(".bun/bin"));
+        dirs.push(home.join(".volta/bin"));
+        dirs.push(home.join(".npm-global/bin"));
+        if let Ok(entries) = std::fs::read_dir(home.join(".nvm/versions/node")) {
+            let mut versions: Vec<_> = entries
+                .flatten()
+                .map(|entry| entry.path().join("bin"))
+                .collect();
+            versions.sort();
+            versions.reverse();
+            dirs.extend(versions);
+        }
         dirs.push(home.join(".arduino-cli/bin"));
         dirs.push(home.join(".platformio/penv/bin"));
         // pip --user on macOS installs under a versioned Python framework dir.
@@ -258,6 +272,23 @@ fn extra_search_dirs() -> Vec<PathBuf> {
         }
     }
     dirs
+}
+
+/// A GUI-launched child needs the same tool locations used for discovery,
+/// including Node for npm adapters whose launcher uses `/usr/bin/env node`.
+pub(crate) fn subprocess_path(executable: &Path) -> Option<std::ffi::OsString> {
+    let inherited = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    std::env::join_paths(
+        executable
+            .parent()
+            .map(Path::to_path_buf)
+            .into_iter()
+            .chain(inherited)
+            .chain(extra_search_dirs()),
+    )
+    .ok()
 }
 
 /// Find `binary` on `PATH` or in one of the well-known install directories.

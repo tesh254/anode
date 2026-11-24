@@ -201,6 +201,15 @@ impl Chip {
         }
     }
 
+    /// The name `esptool --chip` uses for this part. Naming it turns a
+    /// mismatched board model into a refusal rather than a half-written flash.
+    pub fn esptool_name(self) -> &'static str {
+        match self {
+            Chip::Esp8266 => "esp8266",
+            _ => self.idf_target().unwrap_or("auto"),
+        }
+    }
+
     /// The ESP-IDF target name (`idf.py set-target <target>`).
     pub fn idf_target(self) -> Option<&'static str> {
         Some(match self {
@@ -2043,6 +2052,29 @@ pub fn port_key(port: &PortIdentity) -> String {
         .unwrap_or_else(|| port.path.clone())
 }
 
+/// Vendors whose USB-serial bridges front boards from every silicon vendor.
+///
+/// A port behind one of these says nothing about the chip on the other side:
+/// the same CH343 descriptor fronts an ESP32, an ESP32-S3 and plenty of boards
+/// that are not Espressif at all. Only the chip itself can settle it, so this
+/// list marks the ports worth asking rather than guessing about.
+const BRIDGE_VENDORS: &[&str] = &[
+    // Silicon Labs CP210x
+    "10c4", // WCH CH340, CH9102, CH343
+    "1a86", // FTDI
+    "0403", // Prolific PL2303
+    "067b",
+];
+
+/// True when this port is a USB-UART bridge rather than a chip's own USB.
+pub fn is_usb_uart_bridge(port: &PortIdentity) -> bool {
+    port.vendor_id.as_deref().is_some_and(|vid| {
+        BRIDGE_VENDORS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(vid))
+    })
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BoardMatch {
     /// Best resolved board (override, then auto-detect, then none).
@@ -2051,12 +2083,15 @@ pub struct BoardMatch {
     pub exact: bool,
     /// True when the resolution came from a saved user override.
     pub from_override: bool,
+    /// True when the chip answered for itself rather than being inferred from
+    /// a USB descriptor.
+    pub probed: bool,
     /// Board ids the user can pick from to refine an ambiguous match.
     pub candidates: Vec<&'static str>,
 }
 
 impl BoardMatch {
-    /// How confident the resolution is, as one word for the UI.
+    /// How confident the resolution is, as one short phrase for the UI.
     pub fn confidence(&self) -> &'static str {
         if self.board.is_none() {
             "Unidentified"
@@ -2064,9 +2099,40 @@ impl BoardMatch {
             "Pinned"
         } else if self.exact {
             "Identified"
+        } else if self.probed {
+            "Chip detected"
         } else {
             "Best guess"
         }
+    }
+
+    /// Replace a descriptor-based guess with what the silicon itself
+    /// reported.
+    ///
+    /// A pinned board is the user's decision and is never overruled. Anything
+    /// else gives way: a USB bridge can only ever name a family, and it names
+    /// the wrong one as often as the right one, so a chip that answered for
+    /// itself wins — keeping the current entry when it is already a board
+    /// built on that chip, and falling back to the chip's generic entry when
+    /// it is not.
+    pub fn refined_by_chip(mut self, chip: Chip) -> Self {
+        if self.from_override {
+            return self;
+        }
+        self.probed = true;
+        if self.board.is_some_and(|board| board.chip == chip) {
+            return self;
+        }
+        self.board = BOARD_CATALOG
+            .iter()
+            .find(|board| board.chip == chip && board.generic)
+            .or_else(|| BOARD_CATALOG.iter().find(|board| board.chip == chip));
+        self.exact = false;
+        self.candidates = boards_for_chip(chip)
+            .into_iter()
+            .map(|board| board.id)
+            .collect();
+        self
     }
 }
 
@@ -2171,6 +2237,7 @@ pub fn identify_board(
             && best_score > FAMILY_ONLY
             && best.is_some_and(|board| !board.generic),
         from_override: from_override.is_some(),
+        probed: false,
         board: resolved,
         candidates,
     }

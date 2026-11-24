@@ -14,6 +14,12 @@ actions!(anode, [Quit, Save, SaveAll, Run, Build, Stop, Upload]);
 const APP_ICON_PNG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/app-icon.png"));
 
 fn main() {
+    if anode::agent::run_bridge_if_requested() {
+        return;
+    }
+    if let Some(code) = anode::agent::run_connection_check_if_requested() {
+        std::process::exit(code);
+    }
     gpui_kit::application()
         .with_assets(anode::assets::AppAssets)
         .run(|cx| {

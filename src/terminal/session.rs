@@ -41,6 +41,7 @@ impl vt100::Callbacks for Replies {
 }
 
 pub(super) struct Session {
+    captured: Vec<u8>,
     parser: vt100::Parser<Replies>,
     master: Box<dyn MasterPty + Send>,
     input: Sender<Vec<u8>>,
@@ -141,6 +142,7 @@ impl Session {
             _ = output.send(Event::Exited(status));
         });
         Ok(Self {
+            captured: Vec::new(),
             parser: vt100::Parser::new_with_callbacks(
                 nonzero(24),
                 nonzero(80),
@@ -170,7 +172,17 @@ impl Session {
             };
             changed = true;
             match event {
-                Event::Output(bytes) => self.parser.process(&bytes),
+                Event::Output(bytes) => {
+                    self.parser.process(&bytes);
+                    self.captured.extend_from_slice(&bytes);
+                    if self.captured.len() > 256 * 1024 {
+                        let mut start = self.captured.len() - 256 * 1024;
+                        while start < self.captured.len() && self.captured[start] & 0xc0 == 0x80 {
+                            start += 1;
+                        }
+                        self.captured.drain(..start);
+                    }
+                }
                 Event::Exited(status) => self.exit = Some(status),
                 Event::Error(error) => self.error = Some(error),
             }
@@ -188,6 +200,10 @@ impl Session {
                 "The shell is no longer accepting input. Restart the shell to reconnect.".into(),
             );
         }
+    }
+
+    pub(super) fn captured_output(&self) -> String {
+        String::from_utf8_lossy(&self.captured).into_owned()
     }
 
     pub(super) fn paste(&mut self, text: &str) {
