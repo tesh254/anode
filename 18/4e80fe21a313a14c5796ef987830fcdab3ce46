@@ -1,0 +1,19 @@
+docs/handoff.md
+  s_80686613842adb::t_f8da0422c35ded 1-79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "184e80fe21a313a14c5796ef987830fcdab3ce46",
+  "prompts": {},
+  "sessions": {
+    "s_80686613842adb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a20f67-145b-7620-a668-e933ef8f986f",
+        "model": "autorouter"
+      },
+      "human_author": "ericwachira-nrny <eric.wachira@neurony.ro>"
+    }
+  }
+}
